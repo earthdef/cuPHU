@@ -1,0 +1,13 @@
+build/
+dist/
+*.egg-info/
+__pycache__/
+*.pyc
+*.pyo
+*.so
+*.a
+*.o
+.venv/
+.env
+src/cuphu/_version.py
+src/cuphu/_cuphu_ext*.so

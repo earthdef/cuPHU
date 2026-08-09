@@ -65,8 +65,7 @@ ninja -C build install
 
 > If you would like to specify the GPU architectures, change `-DCMAKE_CUDA_ARCHITECTURES=120`
 > for a compute capability 12.0 device, or, for a list of GPUs with different compute
-> capabilities, change to, e.g., `-DCMAKE_CUDA_ARCHITECTURES="80;89"` (quoted, since `;` is a
-> shell separator).
+> capabilities, change to, e.g., `-DCMAKE_CUDA_ARCHITECTURES="80;89"`.
 
 ## Python API
 
@@ -136,9 +135,65 @@ nlooks = cuphu.get_effective_looks(
 unw, conncomp = cuphu.unwrap(igram, corr, nlooks, init="mcf")
 ```
 
-**Work in progress:** a `cuphu` branch of
-[isce3](https://github.com/earthdef/isce3) is wiring
-cuPHU directly into NISAR's ISCE3 InSAR workflow.
+cuPHU is wired directly into NISAR's ISCE3 InSAR workflow on the
+[`cuphu` branch of isce3](https://github.com/earthdef/isce3/tree/cuphu).
+Select it as the `phase_unwrap` algorithm in `runconfig.yaml`:
+
+```yaml
+runconfig:
+    groups:
+        worker:
+            # cuphu requires GPU processing to be enabled.
+            gpu_enabled: True
+            gpu_id: 0
+
+        processing:
+            phase_unwrap:
+                # Choose 'cuphu' as algorithm; other options 'icu', 'phass', 'snaphu'
+                algorithm: cuphu
+                cuphu:
+                    # Unwrapping algorithm: 'mcf' (follow snaphu-mcf) or 'laplace'
+                    init: mcf
+                    # (row, col) tile count for large scenes
+                    ntiles: [4, 4]
+                    tile_overlap: [64, 64]
+                    # CPU threads for parallel tile network-flow solves (mcf only)
+                    nproc: 16
+                    gpu_id: 0
+
+                # cuphu has no CPU-only code path: if worker.gpu_enabled is False,
+                # the workflow automatically falls back to SNAPHU, using this
+                # snaphu: block (independently of the cuphu: block above).
+                snaphu:
+                    # Same semantics as cuphu's init, but the key is
+                    # initialization_method and 'laplace' isn't an option.
+                    initialization_method: mcf
+                    ntiles: [4, 4]
+                    tile_overlap: [64, 64]
+                    nproc: 16
+```
+
+The `cuphu:` block mirrors `cuphu.unwrap()`'s keyword arguments directly
+(see [Full signature](#full-signature)); any option left out falls back to
+isce3's own default (see `share/nisar/defaults/insar.yaml`'s `cuphu:`
+section for the full list and descriptions).
+
+This branch also includes an option to use a different algorithm/settings for
+phase unwrapping in ionosphere correction — `processing.ionosphere_phase_correction.phase_unwrap`
+overrides any field of `processing.phase_unwrap` for that unwrap pass only;
+fields left unset there still inherit from the main `phase_unwrap:` block above.
+For example, to unwrap the main RUNW igram with `cuphu`/`mcf` but use a single-tile `snaphu` on
+CPU for the ionosphere sub-band igrams, which are smoother and smaller:
+
+```yaml
+                ionosphere_phase_correction:
+                    enabled: True
+                    phase_unwrap:
+                        algorithm: snaphu
+                        snaphu:
+                            ntiles: [1, 1]
+                            nproc: 1
+```
 
 #### ISCE2 / Sentinel-1 — from a stackSentinel product
 

@@ -46,6 +46,27 @@ pip install -e . --no-build-isolation
 
 > A conda-forge package is planned; until then, install from source as above.
 
+### Standalone CMake + Ninja install
+
+You may also use CMake + Ninja install method, which allows more flexibility to control compiling options.
+
+```bash
+git clone --recursive https://github.com/earthdef/cuPHU
+cd cuPHU
+cmake -G Ninja -B build \
+    -DCMAKE_INSTALL_PREFIX=/path/to/install \
+    -DCMAKE_CUDA_ARCHITECTURES=native
+ninja -C build install
+```
+
+> If `CMAKE_INSTALL_PREFIX` is the active conda environment `$CONDA_PREFIX`, cuPHU installs
+> into that environment's real `site-packages` instead; otherwise it installs
+> under `<prefix>/packages/cuphu` - remember to add `/path/to/install` to `PYTHONPATH`.
+
+> If you would like to specify the GPU architectures, change `-DCMAKE_CUDA_ARCHITECTURES=120`
+> for a compute capability 12.0 device, or, for a list of GPUs with different compute
+> capabilities, change to, e.g., `-DCMAKE_CUDA_ARCHITECTURES="80;89"` (quoted, since `;` is a
+> shell separator).
 
 ## Python API
 

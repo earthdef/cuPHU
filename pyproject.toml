@@ -5,9 +5,9 @@ build-backend = "scikit_build_core.build"
 [project]
 name = "cuphu"
 authors = [
-  { name = "Lijun Zhu", email = "fdboy007@gmail.com" },
+  { name = "Lijun Zhu", email = "ljzhu@caltech.edu" },
 ]
-description = "GPU-accelerated SNAPHU phase unwrapping with Python wrapper"
+description = "GPU-accelerated phase unwrapping with Python wrapper"
 readme = "README.md"
 keywords = [
   "cuda",

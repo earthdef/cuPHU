@@ -98,7 +98,33 @@ if(BUILD_PYTHON_BINDINGS)
   else()
     find_package(pybind11 CONFIG REQUIRED)
     find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
-    set(_py_dest "cuphu")
+
+    # Where to install the Python package for standalone (non-scikit-build-core)
+    # builds. If CMAKE_INSTALL_PREFIX is the active conda environment, install
+    # straight into its real site-packages (Python3_SITEARCH, from
+    # FindPython3).
+    # To install cuphu with a custom isce3 installation, e.g.:
+    #   cmake -G Ninja -B build -DCMAKE_INSTALL_PREFIX=/opt/isce3
+    #   ninja -C build install
+    get_filename_component(_install_prefix_real "${CMAKE_INSTALL_PREFIX}" REALPATH)
+    set(_conda_prefix_real "")
+    if(DEFINED ENV{CONDA_PREFIX})
+      get_filename_component(_conda_prefix_real "$ENV{CONDA_PREFIX}" REALPATH)
+    endif()
+
+    if(_conda_prefix_real AND _install_prefix_real STREQUAL _conda_prefix_real)
+      set(_py_dest "${Python3_SITEARCH}/cuphu")
+    else()
+      set(_py_dest "${CMAKE_INSTALL_PREFIX}/packages/cuphu")
+    endif()
+
+    # Standalone (non-scikit-build-core) builds: pip normally packages the
+    # pure-Python sources itself, so a plain `cmake --install` needs its own
+    # rule to place them alongside the compiled extension.
+    install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/src/cuphu/"
+      DESTINATION "${_py_dest}"
+      FILES_MATCHING PATTERN "*.py"
+    )
   endif()
 
   pybind11_add_module(_cuphu_ext MODULE

@@ -89,11 +89,16 @@ __global__ void BuildSmoothColCostsKernel(
 
     int arc_idx = row * (ncol - 1) + col;
 
-    /* weight: 0 → masked arc */
+    /* weight: 0 → masked arc. Sentinel values must match SNAPHU's own
+       MaskSmoothCost() (snaphu_cost.c) exactly: CalcCostSmooth() special-
+       cases sigsq==LARGESHORT to skip its cost computation entirely
+       (which otherwise divides by sigsq); sigsq==0 here previously
+       triggered a division-by-zero (SIGFPE) crash the first time a real
+       mask was ever exercised through this path. */
     short w = colweight ? colweight[arc_idx] : 1;
     if (w == 0) {
-        colcost[arc_idx].offset = NOCOSTSHELF;
-        colcost[arc_idx].sigsq  = 0;
+        colcost[arc_idx].offset = LARGESHORT / 2;
+        colcost[arc_idx].sigsq  = LARGESHORT;
         return;
     }
 
@@ -112,8 +117,13 @@ __global__ void BuildSmoothColCostsKernel(
     int    sigsq_i = (int)sigsq_f;
     if (sigsq_i < d_sigsqshortmin) sigsq_i = d_sigsqshortmin;
 
-    /* clamp to short range */
-    int off_i = __double2int_rn(offset);
+    /* clamp to short range. Truncate toward zero (int)offset, not
+       __double2int_rn's round-to-nearest -- SNAPHU CPU quantizes offset by
+       direct double->short assignment, which truncates in C. Empirically
+       verified: __double2int_rn made 48.7% of arcs on a real decorrelated
+       NISAR tile differ from SNAPHU's offset by exactly +-1 (sigsq matched
+       100%), a plausible trigger for CS2's cycle-canceling blowup there. */
+    int off_i = (int)offset;
     off_i = max(off_i, (int)SHRT_MIN);
     off_i = min(off_i, (int)SHRT_MAX);
     sigsq_i = min(sigsq_i, (int)SHRT_MAX);
@@ -138,10 +148,12 @@ __global__ void BuildSmoothRowCostsKernel(
 
     int arc_idx = row * ncol + col;
 
+    /* see BuildSmoothColCostsKernel for why these must match SNAPHU's
+       MaskSmoothCost() sentinel values exactly. */
     short w = rowweight ? rowweight[arc_idx] : 1;
     if (w == 0) {
-        rowcost[arc_idx].offset = NOCOSTSHELF;
-        rowcost[arc_idx].sigsq  = 0;
+        rowcost[arc_idx].offset = LARGESHORT / 2;
+        rowcost[arc_idx].sigsq  = LARGESHORT;
         return;
     }
 
@@ -160,7 +172,8 @@ __global__ void BuildSmoothRowCostsKernel(
     int    sigsq_i = (int)sigsq_f;
     if (sigsq_i < d_sigsqshortmin) sigsq_i = d_sigsqshortmin;
 
-    int off_i = __double2int_rn(offset);
+    /* truncate toward zero, matching SNAPHU CPU -- see BuildSmoothColCostsKernel */
+    int off_i = (int)offset;
     off_i = max(off_i, (int)SHRT_MIN);
     off_i = min(off_i, (int)SHRT_MAX);
     sigsq_i = min(sigsq_i, (int)SHRT_MAX);
@@ -207,11 +220,13 @@ __global__ void BuildDefoColCostsKernel(
 
     int arc_idx = row * (ncol - 1) + col;
 
+    /* masked-arc sentinels must match SNAPHU's MaskCost() (snaphu_cost.c)
+       exactly -- see BuildSmoothColCostsKernel for why sigsq==0 crashes. */
     short w = colweight ? colweight[arc_idx] : 1;
     if (w == 0) {
-        colcost[arc_idx].offset  = NOCOSTSHELF;
-        colcost[arc_idx].sigsq   = 0;
-        colcost[arc_idx].dzmax   = SHRT_MAX;
+        colcost[arc_idx].offset  = LARGESHORT / 2;
+        colcost[arc_idx].sigsq   = LARGESHORT;
+        colcost[arc_idx].dzmax   = LARGESHORT;
         colcost[arc_idx].laycost = 0;
         return;
     }
@@ -265,11 +280,13 @@ __global__ void BuildDefoRowCostsKernel(
 
     int arc_idx = row * ncol + col;
 
+    /* see BuildDefoColCostsKernel for why these must match SNAPHU's
+       MaskCost() sentinel values exactly. */
     short w = rowweight ? rowweight[arc_idx] : 1;
     if (w == 0) {
-        rowcost[arc_idx].offset  = NOCOSTSHELF;
-        rowcost[arc_idx].sigsq   = 0;
-        rowcost[arc_idx].dzmax   = SHRT_MAX;
+        rowcost[arc_idx].offset  = LARGESHORT / 2;
+        rowcost[arc_idx].sigsq   = LARGESHORT;
+        rowcost[arc_idx].dzmax   = LARGESHORT;
         rowcost[arc_idx].laycost = 0;
         return;
     }

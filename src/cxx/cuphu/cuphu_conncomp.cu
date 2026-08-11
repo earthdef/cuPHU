@@ -26,8 +26,29 @@
  *   regression in the new algorithm).
  *
  * Two pixels are connected if:
- *   1. Both have coherence above cost_thresh (not masked), AND
- *   2. |unw_a - unw_b| < π  (locally consistent unwrapped phase)
+ *   1. Both have coherence above a coarse no-data floor (not masked), AND
+ *   2. The arc's incremental cost -- the actual marginal cost of perturbing
+ *      the SOLVED MCF flow on that arc by one unit, i.e. min(poscost,negcost)
+ *      from CalcCostSmooth()'s formula applied at the converged flow -- is at
+ *      least conncompthresh, AND
+ *   3. |unw_a - unw_b| < π  (locally consistent unwrapped phase)
+ *
+ * Condition 2 faithfully mirrors SNAPHU's own GrowConnCompsMask()
+ * (snaphu_tile.c): a *large* incremental cost means the solved network is
+ * confident about this arc's flow value (moving away from it is expensive);
+ * a *small* incremental cost means many flow values are nearly tied there
+ * (typical of decorrelated regions, where sigsq is large), so SNAPHU refuses
+ * to treat it as reliably connected. This requires the actual solved flow,
+ * not just coherence -- an earlier version of this file approximated
+ * connectivity from coherence alone (sigsq derived from rho, thresholded
+ * directly), which get the qualitative dependence on sigsq backwards
+ * relative to incremental cost (incremental cost ~ 1/sigsq at the converged
+ * flow) and in practice was even more permissive than the original flat
+ * corr_thresh heuristic it replaced. d_poscost/d_negcost below are computed
+ * by cuphu_incrcost.cu's ComputeIncrCostsKernel on the actual post-solve
+ * flow, in the same flat row-arc-then-col-arc layout as the cost arrays;
+ * pass nullptr when no MCF solve exists (e.g. Laplace init), which falls
+ * back to phase-agreement + coherence floor only.
  */
 
 #include "cuphu.h"
@@ -36,6 +57,40 @@
 #include <stdint.h>
 #include <cstdlib>
 #include <vector>
+
+/* device helper: flat arc index for a given pixel's neighbor in direction d
+ * (0=up,1=down,2=left,3=right), matching cuphu_cost.cu's row-arc-then-
+ * col-arc flat layout: row arcs [0, (nrow-1)*ncol), then col arcs
+ * [(nrow-1)*ncol, (nrow-1)*ncol + nrow*(ncol-1)). Returns -1 if out of
+ * range (caller already bounds-checks neighbors, so this is just for
+ * clarity/safety). */
+__device__ __forceinline__ int arc_index(int row, int col, int d,
+                                          int nrow, int ncol) {
+    int row_arc_count = (nrow - 1) * ncol;
+    switch (d) {
+        case 0: return (row - 1) * ncol + col;                       /* up: row arc [row-1][col] */
+        case 1: return row * ncol + col;                             /* down: row arc [row][col] */
+        case 2: return row_arc_count + row * (ncol - 1) + (col - 1); /* left: col arc [row][col-1] */
+        case 3: return row_arc_count + row * (ncol - 1) + col;       /* right: col arc [row][col] */
+    }
+    return -1;
+}
+
+/* device helper: is the arc between (row,col) and its direction-d neighbor
+ * confidently connected, per SNAPHU's incremental-cost criterion? d_poscost/
+ * d_negcost NULL means no MCF solve exists (e.g. Laplace init) -- always
+ * confident in that case, matching the original coherence-only behavior. */
+__device__ __forceinline__ bool arc_confident(
+    const short *d_poscost, const short *d_negcost,
+    int row, int col, int d, int nrow, int ncol, long conncompthresh
+) {
+    if (!d_poscost) return true;
+    int aidx = arc_index(row, col, d, nrow, ncol);
+    short pc = d_poscost[aidx];
+    short nc = d_negcost[aidx];
+    short mincost = (pc < nc) ? pc : nc;
+    return (long)mincost >= conncompthresh;
+}
 
 /* ── kernel: initialize labels ──────────────────────────────────────────── */
 __global__ void InitLabelsKernel(uint32_t *labels, int n) {
@@ -68,9 +123,12 @@ __global__ void PropagateLabelsKernel(
     const uint32_t *labels_in,
     uint32_t       *labels_out,
     const float    *unw,
+    const short    *d_poscost,     /* NULL if no MCF solve (e.g. Laplace) */
+    const short    *d_negcost,
     int             nrow,
     int             ncol,
     float           phase_thresh,
+    long            conncompthresh,
     int            *d_changed     /* atomically set to 1 if any label changed */
 ) {
     int col = blockIdx.x * blockDim.x + threadIdx.x;
@@ -98,7 +156,8 @@ __global__ void PropagateLabelsKernel(
         uint32_t nlbl = labels_in[nidx];
         if (nlbl == 0xFFFFFFFFu) continue;
         float diff = fabsf(unw[idx] - unw[nidx]);
-        if (diff < phase_thresh && nlbl < best)
+        if (diff < phase_thresh && nlbl < best &&
+            arc_confident(d_poscost, d_negcost, row, col, d, nrow, ncol, conncompthresh))
             best = nlbl;
     }
 
@@ -119,9 +178,12 @@ __global__ void PropagateLabelsKernel(
 __global__ void MergeLabelsKernel(
     uint32_t    *labels,
     const float *unw,
+    const short *d_poscost,     /* NULL if no MCF solve (e.g. Laplace) */
+    const short *d_negcost,
     int          nrow,
     int          ncol,
     float        phase_thresh,
+    long         conncompthresh,
     int         *d_changed
 ) {
     int col = blockIdx.x * blockDim.x + threadIdx.x;
@@ -144,7 +206,8 @@ __global__ void MergeLabelsKernel(
         uint32_t nlbl = labels[nidx];
         if (nlbl == 0xFFFFFFFFu) continue;
         float diff = fabsf(unw[idx] - unw[nidx]);
-        if (diff < phase_thresh && nlbl < best)
+        if (diff < phase_thresh && nlbl < best &&
+            arc_confident(d_poscost, d_negcost, row, col, d, nrow, ncol, conncompthresh))
             best = nlbl;
     }
 
@@ -230,13 +293,18 @@ void cuphu_conncomp_gpu(
     const unsigned char *d_mask,
     int                 nrow,
     int                 ncol,
-    double              cost_thresh,
-    double              min_frac,
-    long                max_ncomps,
+    const short         *d_poscost,   /* NULL if no MCF solve (e.g. Laplace) */
+    const short         *d_negcost,   /* flat row-arc-then-col-arc layout,   */
+                                       /* same as d_poscost/cuphu_cost.cu    */
+    const CuPhuParams   *params,
     int                 gpu_id,
     uint32_t           *d_labels_out
 ) {
     CUDA_CHECK(cudaSetDevice(gpu_id));
+
+    double min_frac       = params->minconncompfrac;
+    long   max_ncomps     = params->maxncomps;
+    long   conncompthresh = params->conncompthresh;
 
     int    npix     = nrow * ncol;
     int    threads  = 256;
@@ -250,9 +318,11 @@ void cuphu_conncomp_gpu(
     /* ── initialize labels ────────────────────────────────────────────── */
     InitLabelsKernel<<<blocks1d, threads>>>(d_labels_out, npix);
 
-    /* ── mask invalid pixels ─────────────────────────────────────────── */
+    /* ── mask invalid pixels: coarse no-data floor only (real connectivity
+       gating happens per-arc below via sigsq, matching SNAPHU's incremental-
+       cost criterion instead of a flat coherence cutoff) ─────────────────── */
     MaskLabelsKernel<<<blocks1d, threads>>>(
-        d_labels_out, d_corr, d_mask, npix, (float)cost_thresh);
+        d_labels_out, d_corr, d_mask, npix, 0.05f);
 
     /* ── label propagation ────────────────────────────────────────────── */
     int  *d_changed = nullptr;
@@ -282,7 +352,8 @@ void cuphu_conncomp_gpu(
             int batch_end = std::min(it + BATCH, max_iters);
             for ( ; it < batch_end; ++it) {
                 PropagateLabelsKernel<<<grid2d, block2d>>>(
-                    src, dst, d_unw, nrow, ncol, phase_thresh, d_changed);
+                    src, dst, d_unw, d_poscost, d_negcost, nrow, ncol,
+                    phase_thresh, conncompthresh, d_changed);
                 uint32_t *tmp = src; src = dst; dst = tmp;
             }
 
@@ -310,7 +381,8 @@ void cuphu_conncomp_gpu(
             int batch_end = std::min(it + BATCH, max_iters);
             for ( ; it < batch_end; ++it) {
                 MergeLabelsKernel<<<grid2d, block2d>>>(
-                    d_labels_out, d_unw, nrow, ncol, phase_thresh, d_changed);
+                    d_labels_out, d_unw, d_poscost, d_negcost, nrow, ncol,
+                    phase_thresh, conncompthresh, d_changed);
                 JumpLabelsKernel<<<blocks1d, threads>>>(
                     d_labels_out, npix, d_changed);
             }

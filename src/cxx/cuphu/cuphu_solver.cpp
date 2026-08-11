@@ -39,8 +39,11 @@ static long ms_since(std::chrono::steady_clock::time_point t0) {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - t0).count();
 }
+/* set once per thread at the top of solve_tile() so TOCK() lines from
+   concurrent tiles' interleaved stderr output can be attributed to a tile. */
+static thread_local int g_tile_idx = -1;
 #define TICK() auto _T = std::chrono::steady_clock::now()
-#define TOCK(label) fprintf(stderr,"[prof] %-28s %4ld ms\n",(label),ms_since(_T)); \
+#define TOCK(label) fprintf(stderr,"[prof][tile%d] %-28s %4ld ms\n",g_tile_idx,(label),ms_since(_T)); \
                     fflush(stderr); _T=std::chrono::steady_clock::now()
 #else
 #define TICK()       do {} while(0)
@@ -113,7 +116,7 @@ extern "C" void cuphu_integrate_phase_gpu(
 
 extern "C" void cuphu_conncomp_gpu(
     const float*, const float*, const unsigned char*,
-    int, int, double, double, long, int, uint32_t*);
+    int, int, const short*, const short*, const CuPhuParams*, int, uint32_t*);
 
 extern "C" void cuphu_wrap_phase(float*, int, cudaStream_t);
 
@@ -340,6 +343,30 @@ static int solve_tile(
     size_t ncolcost = (size_t)tile_nrow * (tile_ncol - 1);
     size_t ncost_total = nrowcost + ncolcost;
 
+    /* ── arc weights from mask (0 = masked arc, matching SNAPHU's
+     * BuildCostArrays(): "set weights to zero for arcs adjacent to
+     * zero-magnitude pixels"). NULL when no mask is supplied, matching
+     * the prior (unmasked) behavior exactly. */
+    DevArray<short> d_roww_arr, d_colw_arr;
+    const short *d_roww = nullptr, *d_colw = nullptr;
+    if (h_mask_tile) {
+        std::vector<short> h_roww(nrowcost), h_colw(ncolcost);
+        for (int r = 0; r < tile_nrow - 1; ++r)
+            for (int c = 0; c < tile_ncol; ++c)
+                h_roww[(size_t)r * tile_ncol + c] =
+                    (h_mask_tile[(size_t)r * tile_ncol + c] &&
+                     h_mask_tile[(size_t)(r + 1) * tile_ncol + c]) ? 1 : 0;
+        for (int r = 0; r < tile_nrow; ++r)
+            for (int c = 0; c < tile_ncol - 1; ++c)
+                h_colw[(size_t)r * (tile_ncol - 1) + c] =
+                    (h_mask_tile[(size_t)r * tile_ncol + c] &&
+                     h_mask_tile[(size_t)r * tile_ncol + c + 1]) ? 1 : 0;
+        d_roww_arr = DevArray<short>(h_roww.data(), nrowcost);
+        d_colw_arr = DevArray<short>(h_colw.data(), ncolcost);
+        d_roww = d_roww_arr.get();
+        d_colw = d_colw_arr.get();
+    }
+
     /* Keep GPU smooth-cost array alive for the incrcost early-exit check. */
     smoothcostT *d_smooth_costs = nullptr;  /* only set for SMOOTH mode */
     void        *d_costs_generic = nullptr;
@@ -347,7 +374,7 @@ static int solve_tile(
 
     if (cost_mode == CUPHU_COST_SMOOTH) {
         cuphu_build_smooth_costs_gpu(
-            d_phase.get(), d_corr.get(), nullptr, nullptr,
+            d_phase.get(), d_corr.get(), d_roww, d_colw,
             tile_nrow, tile_ncol, params,
             params->kperpdpsi, params->kpardpsi,
             &d_smooth_costs, stream);
@@ -356,7 +383,7 @@ static int solve_tile(
     } else {
         costT *d_cost = nullptr;
         cuphu_build_defo_costs_gpu(
-            d_phase.get(), d_corr.get(), nullptr, nullptr,
+            d_phase.get(), d_corr.get(), d_roww, d_colw,
             tile_nrow, tile_ncol, params,
             params->kperpdpsi, params->kpardpsi,
             &d_cost, stream);
@@ -401,9 +428,8 @@ static int solve_tile(
         cuphu_conncomp_gpu(
             d_unw_lap.get(), d_corr2.get(), mask_lap_ptr,
             tile_nrow, tile_ncol,
-            /*cost_thresh=*/0.1,
-            params->minconncompfrac,
-            params->maxncomps,
+            /*poscost=*/nullptr, /*negcost=*/nullptr,   /* no MCF solve in laplace init */
+            params,
             gpu_id,
             d_conncomp.get());
         TOCK("GPU conncomp");
@@ -483,12 +509,31 @@ static int solve_tile(
     {
         short **mst_costs = (short **)Get2DRowColMem(
             tile_nrow, tile_ncol, (int)sizeof(short *), sizeof(short));
-        for (int r = 0; r < tile_nrow - 1; ++r)
-            for (int c = 0; c < tile_ncol; ++c)
-                mst_costs[r][c] = 1;
-        for (int r = 0; r < tile_nrow; ++r)
-            for (int c = 0; c < tile_ncol - 1; ++c)
-                mst_costs[tile_nrow - 1 + r][c] = 1;
+        /* Match SNAPHU's BuildCostArrays() (snaphu_cost.c): the initial-flow
+         * weight for each arc is the smaller of the incremental cost of a
+         * +-1 unit flow perturbation from flow=0, clipped to
+         * [MINSCALARCOST, maxcost] -- NOT a flat 1 everywhere. A flat weight
+         * discards all per-arc confidence information (from coherence/sigsq)
+         * that CS2 needs to find a well-conditioned initial flow; empirically
+         * this was found to make CS2's initial flow diverge substantially
+         * from SNAPHU's on a real decorrelated tile (89% arc-identical, not
+         * ~100%), plausibly explaining a large CPU TreeSolve slowdown there. */
+        for (int r = 0; r < tile_nrow - 1; ++r) {
+            for (int c = 0; c < tile_ncol; ++c) {
+                long poscost, negcost;
+                CalcCost(costs_pp, 0, r, c, 1, tile_nrow, &sp, &poscost, &negcost);
+                mst_costs[r][c] = (short)LClip(std::min(poscost, negcost),
+                                                MINSCALARCOST, (long)sp.maxcost);
+            }
+        }
+        for (int r = 0; r < tile_nrow; ++r) {
+            for (int c = 0; c < tile_ncol - 1; ++c) {
+                long poscost, negcost;
+                CalcCost(costs_pp, 0, tile_nrow - 1 + r, c, 1, tile_nrow, &sp, &poscost, &negcost);
+                mst_costs[tile_nrow - 1 + r][c] = (short)LClip(std::min(poscost, negcost),
+                                                                MINSCALARCOST, (long)sp.maxcost);
+            }
+        }
 
         if (sp.initmethod == MSTINIT) {
             MSTInitFlows(phase_pp, &flows, mst_costs,
@@ -578,12 +623,6 @@ static int solve_tile(
                                    : "fail (TreeSolve runs)");
     }
 
-    /* GPU cost array no longer needed */
-    if (d_smooth_costs) {
-        CUDA_CHECK(cudaFree(d_smooth_costs));
-        d_smooth_costs = nullptr;
-    }
-
     /* ── main solver loop (skipped when GPU early-exit passes) ───────── */
     if (!gpu_early_exit) {
         totalcostT oldtotalcost = totalcost;
@@ -635,7 +674,32 @@ static int solve_tile(
             }
             (void)oldtotalcost; (void)mintotalcost; (void)nnondecreasedcostiter;
         }
+
+        /* TreeSolve changed `flows`, so d_poscost_arr/d_negcost_arr (computed
+         * above against the pre-solve flow) are stale -- refresh them at the
+         * converged flow for cuphu_conncomp_gpu's incremental-cost-based
+         * connectivity criterion. When gpu_early_exit was true instead, the
+         * pre-solve values already ARE the converged ones (TreeSolve never
+         * ran), so no refresh is needed there. */
+        if (cost_mode == CUPHU_COST_SMOOTH && d_smooth_costs != nullptr) {
+            std::vector<short> h_flows_flat_post;
+            flatten_flows(flows, tile_nrow, tile_ncol, h_flows_flat_post);
+            CUDA_CHECK(cudaMemcpy(d_flows_flat_arr.get(), h_flows_flat_post.data(),
+                                  h_flows_flat_post.size() * sizeof(short),
+                                  cudaMemcpyHostToDevice));
+            (void)cuphu_incrcost_early_exit(
+                d_smooth_costs, d_flows_flat_arr.get(),
+                (int)ncost_total, sp.nshortcycle, /*nflow=*/1,
+                d_poscost_arr.get(), d_negcost_arr.get(), d_scratch_arr.get());
+        }
     } /* end !gpu_early_exit */
+
+    /* GPU cost array no longer needed -- kept alive until here so the
+     * post-solve incremental-cost refresh above could use it. */
+    if (d_smooth_costs) {
+        CUDA_CHECK(cudaFree(d_smooth_costs));
+        d_smooth_costs = nullptr;
+    }
 
     /* ── flatten flows for GPU phase integration ─────────────────────── */
     size_t nhflows = nrowcost;
@@ -673,9 +737,8 @@ static int solve_tile(
     cuphu_conncomp_gpu(
         d_unw.get(), d_corr2.get(), mask_dev_ptr,
         tile_nrow, tile_ncol,
-        /*cost_thresh=*/0.1,
-        params->minconncompfrac,
-        params->maxncomps,
+        d_poscost_arr.get(), d_negcost_arr.get(),   /* NULL for non-smooth cost modes */
+        params,
         gpu_id,
         d_conncomp.get());
     TOCK("GPU conncomp");
@@ -803,6 +866,9 @@ int cuphu_unwrap(
      * TreeSolve, GPU cost/phase/conncomp—runs fully concurrently. */
     run_parallel(ntiles, tile->nproc, [&](int idx) {
         TileWork& tw = tiles[idx];
+#ifdef CUPHU_PROFILE
+        g_tile_idx = idx;
+#endif
         solve_tile(
             tw.phase.data(), tw.corr_t.data(),
             tw.mag_t.empty()  ? nullptr : tw.mag_t.data(),
@@ -1008,10 +1074,21 @@ int cuphu_build_costs_gpu(
     size_t nrowcost = (size_t)(nrow - 1) * ncol;
     size_t ncolcost = (size_t)nrow * (ncol - 1);
 
+    /* weights (if given) is flat row-arcs-then-col-arcs, same convention as
+     * the cost arrays this function returns. */
+    DevArray<short> d_roww_arr, d_colw_arr;
+    const short *d_roww = nullptr, *d_colw = nullptr;
+    if (weights) {
+        d_roww_arr = DevArray<short>(weights, nrowcost);
+        d_colw_arr = DevArray<short>(weights + nrowcost, ncolcost);
+        d_roww = d_roww_arr.get();
+        d_colw = d_colw_arr.get();
+    }
+
     if (cost_mode == CUPHU_COST_SMOOTH) {
         smoothcostT *d_c = nullptr;
         cuphu_build_smooth_costs_gpu(
-            d_phase.get(), d_corr.get(), nullptr, nullptr,
+            d_phase.get(), d_corr.get(), d_roww, d_colw,
             nrow, ncol, params, params->kperpdpsi, params->kpardpsi,
             &d_c, 0);
         size_t nb = (nrowcost + ncolcost) * sizeof(smoothcostT);
@@ -1022,7 +1099,7 @@ int cuphu_build_costs_gpu(
     } else {
         costT *d_c = nullptr;
         cuphu_build_defo_costs_gpu(
-            d_phase.get(), d_corr.get(), nullptr, nullptr,
+            d_phase.get(), d_corr.get(), d_roww, d_colw,
             nrow, ncol, params, params->kperpdpsi, params->kpardpsi,
             &d_c, 0);
         size_t nb = (nrowcost + ncolcost) * sizeof(costT);

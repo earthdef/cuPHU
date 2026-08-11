@@ -5,6 +5,7 @@ project(cuPHU LANGUAGES C CXX CUDA)
 # ── options ──────────────────────────────────────────────────────────────────
 option(BUILD_PYTHON_BINDINGS "Build pybind11 Python extension" ON)
 option(BUILD_TESTS           "Build C++ unit tests"             OFF)
+option(CUPHU_PROFILE          "Print per-stage TICK/TOCK timers to stderr" OFF)
 
 set(CMAKE_C_STANDARD    11)   # _Thread_local in patched CS2
 set(CMAKE_CXX_STANDARD  17)
@@ -81,6 +82,10 @@ set_target_properties(cuphu_core PROPERTIES
 target_compile_options(cuphu_core PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>
 )
+
+if(CUPHU_PROFILE)
+  target_compile_definitions(cuphu_core PRIVATE CUPHU_PROFILE)
+endif()
 
 target_link_libraries(cuphu_core PUBLIC
   snaphu_lib

@@ -196,9 +196,12 @@ void cuphu_conncomp_gpu(
     const unsigned char *mask,    /* may be NULL                  */
     int             nrow,
     int             ncol,
-    double          cost_thresh,
-    double          min_frac,
-    long            max_ncomps,
+    const short    *poscost,      /* NULL if no MCF solve (e.g. Laplace); */
+    const short    *negcost,      /* else flat row-arc-then-col-arc, from */
+                                   /* cuphu_incrcost_early_exit() at the   */
+                                   /* converged (post-solve) flow          */
+    const struct CuPhuParams *params, /* statistical cost model +
+                                          conncompthresh/minconncompfrac/maxncomps */
     int             gpu_id,
     uint32_t       *labels_out    /* nrow*ncol                    */
 );

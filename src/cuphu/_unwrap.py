@@ -80,6 +80,7 @@ def unwrap(
     nproc: int = 1,
     tile_cost_thresh: int = 500,
     min_region_size: int = 100,
+    single_tile_reoptimize: bool = False,
     gpu_id: int = 0,
     unw: OutputDataset,
     conncomp: OutputDataset,
@@ -104,6 +105,7 @@ def unwrap(
     nproc: int = 1,
     tile_cost_thresh: int = 500,
     min_region_size: int = 100,
+    single_tile_reoptimize: bool = False,
     gpu_id: int = 0,
 ) -> tuple[np.ndarray, np.ndarray]: ...
 
@@ -129,6 +131,7 @@ def unwrap(  # type: ignore[no-untyped-def]
     nproc=1,
     tile_cost_thresh=500,
     min_region_size=100,
+    single_tile_reoptimize=False,
     gpu_id=0,
     unw=None,
     conncomp=None,
@@ -206,6 +209,34 @@ def unwrap(  # type: ignore[no-untyped-def]
         Cost threshold for determining reliable tile regions.
     min_region_size : int, optional
         Minimum number of pixels in a reliable tile region.
+    single_tile_reoptimize : bool, optional
+        After tiled unwrapping and stitching, rerun a full CPU network-flow
+        solve (SNAPHU's exact TreeSolve, not the GPU-accelerated path) over
+        the entire assembled scene as a single tile, seeded from the
+        stitched result, to clean up tile-boundary artifacts. Has no effect
+        when the effective tiling is ``(1, 1)``.
+
+        cuPHU's own tile stitching (median 2π offset per tile pair,
+        propagated via a spanning tree over tile adjacency) is
+        coarser than SNAPHU's own per-region secondary-network stitching:
+        it applies one constant offset per whole tile (can't correct a
+        real discontinuity crossing through the middle of a tile), and has
+        no loop-closure correction when the tile grid has cycles (any
+        ``ntilerow >= 2 and ntilecol >= 2`` layout). This option is the
+        cleanup pass for those cases -- directly analogous to SNAPHU's own
+        ``SINGLETILEREOPTIMIZE`` / ``snaphu-py``'s identically-named
+        ``single_tile_reoptimize`` parameter. It also merges connected-
+        component labels across tile boundaries as a side effect (today,
+        without it, the same physical region spanning multiple tiles gets
+        distinct label ranges per tile).
+
+        Defaults to ``False``, deliberately diverging from ``snaphu-py``'s
+        default of ``True``: this is a full-scene CPU network-flow solve
+        that can dominate total wall time on large scenes (the same
+        mechanism that made ``snaphu-py``'s reopt pass run for hours on a
+        large NISAR scene when left at its default). Enable it for final/
+        delivery-quality runs, or when tile-boundary artifacts are visibly
+        present; leave it off for speed-sensitive runs.
     gpu_id : int, optional
         CUDA device index. Defaults to 0.
     unw : array_like or None, optional
@@ -314,6 +345,7 @@ def unwrap(  # type: ignore[no-untyped-def]
         tilecostthresh=tile_cost_thresh,
         minregionsize=min_region_size,
         nproc=nproc,
+        single_tile_reoptimize=bool(single_tile_reoptimize),
         gpu_id=gpu_id,
     )
 

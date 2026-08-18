@@ -5,6 +5,8 @@ input validation and the CPU fallback paths only.  GPU-specific tests are
 marked with `pytest.mark.gpu` and skipped when no GPU is available.
 """
 
+import os
+
 import numpy as np
 import pytest
 
@@ -184,6 +186,158 @@ def test_unwrap_tiled_matches_single(
     valid = np.isfinite(unw_ref) & np.isfinite(unw_tiled)
     diff = np.abs(unw_ref[valid] - unw_tiled[valid])
     assert float(np.percentile(diff, 95)) < 0.5  # < 0.5 rad at 95th percentile
+
+
+# ── single_tile_reoptimize ──────────────────────────────────────────────────
+#
+# _reopt_igram/_reopt_corr deliberately use more noise and lower coherence
+# than small_igram/small_corr: cuphu's own tile stitching (median 2pi offset
+# per tile, no per-region reconciliation, no loop-closure correction) tends
+# to already get "nice" data right, which would make these tests pass
+# trivially without actually exercising TreeSolve's refinement. This fixture
+# was confirmed during development (CUPHU_DEBUG=1) to produce a real,
+# non-trivial correction: seeded (pre-TreeSolve) cost ~4.04M -> final
+# (post-TreeSolve) cost ~3.96M, a genuine ~2% improvement, not a no-op.
+
+@pytest.fixture()
+def reopt_igram() -> np.ndarray:
+    """200x200 complex64, noisier/lower-coherence than small_igram -- see
+    module note above for why that matters for these specific tests."""
+    rng = np.random.default_rng(11)
+    nrow, ncol = 200, 200
+    r = np.arange(nrow, dtype=np.float32)
+    c = np.arange(ncol, dtype=np.float32)
+    phase = (0.5 * r[:, None] + 0.6 * c[None, :]
+             + rng.normal(scale=1.8, size=(nrow, ncol)).astype(np.float32))
+    return np.exp(1j * phase).astype(np.complex64)
+
+
+@pytest.fixture()
+def reopt_corr() -> np.ndarray:
+    return np.full((200, 200), 0.25, dtype=np.float32)
+
+
+@pytest.fixture()
+def reopt_conncomp_igram() -> np.ndarray:
+    """200x200 complex64, distinct from reopt_igram: this specific
+    phase/noise/coherence combination was confirmed during development to
+    naturally fragment into one conncomp label per tile pre-reopt (unlike
+    reopt_igram, which forms a single region even without reopt for this
+    fixture's cost-improvement purposes) -- needed for
+    test_reopt_merges_conncomp_across_tiles to exercise the actual gap."""
+    rng = np.random.default_rng(5)
+    nrow, ncol = 200, 200
+    r = np.arange(nrow, dtype=np.float32)
+    c = np.arange(ncol, dtype=np.float32)
+    phase = (0.15 * r[:, None] + 0.2 * c[None, :]
+             + rng.normal(scale=0.5, size=(nrow, ncol)).astype(np.float32))
+    return np.exp(1j * phase).astype(np.complex64)
+
+
+@pytest.fixture()
+def reopt_conncomp_corr() -> np.ndarray:
+    return np.full((200, 200), 0.6, dtype=np.float32)
+
+
+@gpu_only
+def test_reopt_single_tile_is_noop(
+    small_igram: np.ndarray, small_corr: np.ndarray
+) -> None:
+    """single_tile_reoptimize has no effect when the effective tiling is
+    (1, 1) -- confirms the ntiles>1 gate in cuphu_unwrap()'s C++ driver."""
+    unw_off, cc_off = cuphu.unwrap(small_igram, small_corr, nlooks=10.0,
+                                    ntiles=(1, 1), single_tile_reoptimize=False)
+    unw_on, cc_on = cuphu.unwrap(small_igram, small_corr, nlooks=10.0,
+                                  ntiles=(1, 1), single_tile_reoptimize=True)
+    np.testing.assert_array_equal(unw_off, unw_on)
+    np.testing.assert_array_equal(cc_off, cc_on)
+
+
+@gpu_only
+def test_reopt_default_off_unchanged(
+    small_igram: np.ndarray, small_corr: np.ndarray
+) -> None:
+    """Omitting single_tile_reoptimize must match passing it explicitly
+    False -- confirms zero behavior change to the default path."""
+    unw_default, cc_default = cuphu.unwrap(
+        small_igram, small_corr, nlooks=10.0, ntiles=(2, 2), tile_overlap=4)
+    unw_explicit, cc_explicit = cuphu.unwrap(
+        small_igram, small_corr, nlooks=10.0, ntiles=(2, 2), tile_overlap=4,
+        single_tile_reoptimize=False)
+    np.testing.assert_array_equal(unw_default, unw_explicit)
+    np.testing.assert_array_equal(cc_default, cc_explicit)
+
+
+@gpu_only
+def test_reopt_improves_cost_at_tile_boundary(
+    reopt_igram: np.ndarray, reopt_corr: np.ndarray, capfd: pytest.CaptureFixture
+) -> None:
+    """TreeSolve is a monotonically-non-increasing local search from a
+    feasible start, so the post-reopt total cost must be <= the seeded
+    (pre-TreeSolve) cost -- and, on this fixture, genuinely lower (not just
+    equal), confirming reopt does real refinement work rather than a no-op.
+    EvaluateTotalCost has no direct Python binding; captured via the
+    existing CUPHU_DEBUG stderr print instead (cuphu_solver.cpp)."""
+    os.environ["CUPHU_DEBUG"] = "1"
+    try:
+        unw, cc = cuphu.unwrap(reopt_igram, reopt_corr, nlooks=4.0,
+                                cost="smooth", init="mcf",
+                                ntiles=(2, 2), tile_overlap=4,
+                                single_tile_reoptimize=True)
+    finally:
+        del os.environ["CUPHU_DEBUG"]
+
+    assert np.isfinite(unw).all()
+
+    lines = capfd.readouterr().err.splitlines()
+    seed_idx = next((i for i, l in enumerate(lines) if "seeded flow cost" in l), None)
+    assert seed_idx is not None, "expected a 'seeded flow cost' debug line from the reopt pass"
+    # only lines after the seed line can belong to the reopt pass itself
+    # (per-tile solves print their own "final total cost" earlier, during
+    # tiling) -- if the reopt call's own early-exit fires, no such line
+    # follows at all, which should fail loudly here, not silently grab a
+    # per-tile line.
+    final_after_seed = [l for l in lines[seed_idx:] if "final total cost" in l]
+    assert final_after_seed, "expected a 'final total cost' line after the reopt pass"
+
+    seed_cost = float(lines[seed_idx].rsplit(":", 1)[1])
+    reopt_final_cost = float(final_after_seed[0].rsplit(":", 1)[1])
+
+    assert reopt_final_cost <= seed_cost
+    assert reopt_final_cost < seed_cost * 0.99, (
+        "expected a measurable (>1%) improvement on this fixture, got "
+        f"seed={seed_cost} final={reopt_final_cost} -- if this fixture "
+        "stopped exercising real TreeSolve refinement, it needs revisiting"
+    )
+
+
+@gpu_only
+@pytest.mark.parametrize("ntiles", [(2, 2), (2, 3)])
+def test_reopt_merges_conncomp_across_tiles(
+    ntiles: tuple[int, int],
+    reopt_conncomp_igram: np.ndarray,
+    reopt_conncomp_corr: np.ndarray,
+) -> None:
+    """Without reopt, cuphu's tile stitching never merges connected-
+    component labels across tile boundaries (comp_offset just concatenates
+    per-tile label spaces) -- documents that known gap on a fixture
+    confirmed (CUPHU_DEBUG, during development) to fragment into multiple
+    labels pre-reopt, and confirms reopt fixes it as a side effect
+    (conncomp is fully recomputed over the assembled, re-solved scene)."""
+    _, cc_off = cuphu.unwrap(reopt_conncomp_igram, reopt_conncomp_corr,
+                              nlooks=8.0, ntiles=ntiles, tile_overlap=16,
+                              single_tile_reoptimize=False)
+    _, cc_on = cuphu.unwrap(reopt_conncomp_igram, reopt_conncomp_corr,
+                             nlooks=8.0, ntiles=ntiles, tile_overlap=16,
+                             single_tile_reoptimize=True)
+    n_off = np.unique(cc_off).size
+    n_on = np.unique(cc_on).size
+    assert n_off > 1, (
+        "expected today's known gap: multiple conncomp labels pre-reopt "
+        f"(got {n_off}) -- fixture may no longer exercise the fragmentation "
+        "this test is meant to document"
+    )
+    assert n_on < n_off, "expected reopt to merge labels across tile boundaries"
 
 
 @gpu_only

@@ -118,6 +118,7 @@ py::tuple py_unwrap_arrays(
     int     tilecostthresh  = DEF_TILECOSTTHRESH,
     int     minregionsize   = DEF_MINREGIONSIZE,
     int     nproc           = 1,
+    bool    single_tile_reoptimize = false,
     int     gpu_id          = 0
 ) {
     if (igram.ndim() != 2)
@@ -174,6 +175,7 @@ py::tuple py_unwrap_arrays(
     tile.tilecostthresh = tilecostthresh;
     tile.minregionsize  = minregionsize;
     tile.nproc          = nproc;
+    tile.single_tile_reoptimize = single_tile_reoptimize ? 1 : 0;
 
     CuPhuResult result = {};
     int rc = cuphu_unwrap(
@@ -313,6 +315,7 @@ PYBIND11_MODULE(_cuphu_ext, m) {
         "tilecostthresh"_a    = DEF_TILECOSTTHRESH,
         "minregionsize"_a     = DEF_MINREGIONSIZE,
         "nproc"_a        = 1,
+        "single_tile_reoptimize"_a = false,
         "gpu_id"_a       = 0,
         R"(
 Unwrap an interferogram using GPU-accelerated SNAPHU.
@@ -335,6 +338,13 @@ mask : ndarray, uint8, 2-D, optional
     Valid-pixel mask (0 = invalid).
 mag : ndarray, float32, 2-D, optional
     Interferogram magnitude. Derived from igram if None.
+single_tile_reoptimize : bool, optional
+    After tiled unwrapping and stitching, rerun a full CPU network-flow
+    solve over the whole assembled scene as one tile to clean up tile-
+    boundary artifacts (matches snaphu-py's parameter of the same name).
+    No effect when ntilerow*ntilecol == 1. Off by default: this is a
+    full-scene CPU solve with the same cost profile as snaphu-py's
+    single_tile_reoptimize, which can dominate wall time on large scenes.
 gpu_id : int, optional
     CUDA device index (default 0).
 

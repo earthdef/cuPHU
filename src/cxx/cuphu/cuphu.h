@@ -99,6 +99,12 @@ typedef struct CuPhuTileParams {
     int minregionsize;
     int nproc;               /* max CPU threads for tile network flow         */
     int ngpustreams;         /* CUDA streams for parallel tile cost compute   */
+    int single_tile_reoptimize; /* after tiled stitching, rerun CPU TreeSolve
+                                  * over the whole assembled scene as one tile
+                                  * to clean up tile-boundary artifacts (see
+                                  * snaphu-py's identically-named parameter).
+                                  * Off by default -- see cuphu_unwrap()'s
+                                  * multi-tile path.                          */
 } CuPhuTileParams;
 
 /* ── top-level result handle ─────────────────────────────────────────────── */

@@ -209,6 +209,12 @@ void cuphu_default_params(CuPhuParams *p) {
 
 extern "C"
 void cuphu_default_tile_params(CuPhuTileParams *tp) {
+    /* Unlike cuphu_default_params() above, this function historically never
+     * memset the struct first -- any field added here without an explicit
+     * assignment is uninitialized stack garbage at the call site
+     * (cuphu_py.cu declares CuPhuTileParams tile; with no zero-init).
+     * Guard against that for future fields, not just the one added now. */
+    std::memset(tp, 0, sizeof(*tp));
     tp->ntilerow       = DEF_NTILEROW;
     tp->ntilecol       = DEF_NTILECOL;
     tp->rowovrlp       = DEF_ROWOVRLP;
@@ -217,6 +223,7 @@ void cuphu_default_tile_params(CuPhuTileParams *tp) {
     tp->minregionsize  = DEF_MINREGIONSIZE;
     tp->nproc          = 1;
     tp->ngpustreams    = 2;
+    tp->single_tile_reoptimize = 0;
 }
 
 /* ── translate CuPhuParams → SNAPHU's paramT ─────────────────────────── */
@@ -310,6 +317,14 @@ static void flatten_flows(
 }
 
 /* ── single-tile solve ──────────────────────────────────────────────────── */
+/*
+ * h_unw_seed_tile: optional, full-tile-sized (tile_nrow*tile_ncol) already-
+ * unwrapped phase estimate. When non-null, flows are derived directly from
+ * this estimate via SNAPHU's own CalcFlow() (same math as SNAPHU's native
+ * reopt path, snaphu_util.c) instead of MST/MCF/Laplace init -- the caller
+ * is asking to *refine* an existing unwrapping (e.g. cuphu_unwrap()'s
+ * single_tile_reoptimize pass), not solve from scratch.
+ */
 static int solve_tile(
     const float          *h_phase_tile,
     const float          *h_corr_tile,
@@ -322,7 +337,8 @@ static int solve_tile(
     const CuPhuParams *params,
     int                   gpu_id,
     float                *h_unw_tile,
-    uint32_t             *h_conncomp_tile
+    uint32_t             *h_conncomp_tile,
+    const float          *h_unw_seed_tile = nullptr
 ) {
     CUDA_CHECK(cudaSetDevice(gpu_id));
 
@@ -397,7 +413,7 @@ static int solve_tile(
      * pipeline.  Solves L·u = b on GPU via Jacobi-preconditioned CG.
      * Expected speedup over TreeSolve: ~50-200× for typical InSAR scenes.
      */
-    if (init_meth == CUPHU_INIT_LAPLACE) {
+    if (init_meth == CUPHU_INIT_LAPLACE && !h_unw_seed_tile) {
         if (cost_mode != CUPHU_COST_SMOOTH)
             throw std::runtime_error("CUPHU_INIT_LAPLACE requires smooth cost mode");
 
@@ -502,11 +518,41 @@ static int solve_tile(
         EvalCost = EvalCostDefo;
     }
 
-    /* Both MCFInitFlows (via SolveCS2) and MSTInitFlows call
-     * Free2DArray(mstcosts, 2*nrow-1) internally, so mstcosts MUST be
-     * allocated through SNAPHU's Get2DRowColMem and NOT wrapped in a
-     * std::vector — the callee owns and frees it. */
-    {
+    if (h_unw_seed_tile) {
+        /* Reopt-style seeding: derive flows directly from an already-
+         * unwrapped estimate via SNAPHU's own CalcFlow() -- the same math
+         * SNAPHU's native reopt path uses (ExtractFlow(), snaphu_util.c),
+         * but fed the exact original wrapped phase (phase_pp, computed via
+         * atan2 before this function's cost-building step) rather than
+         * reconstructing a slightly-lossy copy via mod-2pi off the
+         * estimate -- real SNAPHU only does that reconstruction because its
+         * reopt process doesn't have the original wrapped phase in memory;
+         * cuPHU does. nodes/ground stay null/default here, matching the
+         * MCFINIT branch below: InitNetwork() allocates nodes itself when
+         * still null. */
+        std::vector<float> h_seed_copy(h_unw_seed_tile, h_unw_seed_tile + npix);
+        auto seed2d = make_2d_ptrs(h_seed_copy.data(), tile_nrow, tile_ncol);
+        CalcFlow(seed2d.data(), &flows, tile_nrow, tile_ncol);
+
+        if (std::getenv("CUPHU_DEBUG")) {
+            /* Sanity check: TreeSolve is a monotonically-non-increasing
+             * local search from a feasible start, so the "final total
+             * cost" print further down (after TreeSolve runs) must be
+             * <= this seeded-but-not-yet-refined cost. narcsperrow is
+             * unused in grid mode (only the non-grid/secondary-network
+             * branch reads it), safe to pass null here before
+             * InitNetwork() computes the real one. */
+            totalcostT seedcost = EvaluateTotalCost(
+                costs_pp, flows, tile_nrow, tile_ncol, nullptr, &sp);
+            fprintf(stderr,
+                    "[cuphu] seeded flow cost (pre-TreeSolve, reopt): %.16g\n",
+                    (double)seedcost);
+        }
+    } else {
+        /* Both MCFInitFlows (via SolveCS2) and MSTInitFlows call
+         * Free2DArray(mstcosts, 2*nrow-1) internally, so mstcosts MUST be
+         * allocated through SNAPHU's Get2DRowColMem and NOT wrapped in a
+         * std::vector — the callee owns and frees it. */
         short **mst_costs = (short **)Get2DRowColMem(
             tile_nrow, tile_ncol, (int)sizeof(short *), sizeof(short));
         /* Match SNAPHU's BuildCostArrays() (snaphu_cost.c): the initial-flow
@@ -544,7 +590,7 @@ static int solve_tile(
         }
         /* mst_costs is freed inside MCFInitFlows/MSTInitFlows; do not free */
     }
-    TOCK("InitFlows (MCF or MST)");
+    TOCK("InitFlows (MCF/MST/seeded)");
 
     /* ── solver data structures ──────────────────────────────────────── */
     long ngroundarcs, ncycle, nflowdone, mostflow, nflow;
@@ -675,6 +721,12 @@ static int solve_tile(
             (void)oldtotalcost; (void)mintotalcost; (void)nnondecreasedcostiter;
         }
 
+        if (std::getenv("CUPHU_DEBUG")) {
+            totalcostT finalcost = EvaluateTotalCost(
+                costs_pp, flows, tile_nrow, tile_ncol, narcsperrow, &sp);
+            fprintf(stderr, "[cuphu] final total cost: %.16g\n", (double)finalcost);
+        }
+
         /* TreeSolve changed `flows`, so d_poscost_arr/d_negcost_arr (computed
          * above against the pre-solve flow) are stale -- refresh them at the
          * converged flow for cuphu_conncomp_gpu's incremental-cost-based
@@ -747,6 +799,19 @@ static int solve_tile(
     d_unw.to_host(h_unw_tile);
     d_conncomp.to_host(h_conncomp_tile);
     TOCK("D2H download");
+
+    /* flows/nodes were never freed here previously -- harmless at ordinary
+     * per-tile scale, not harmless once a seeded (reopt) call allocates
+     * these at full-scene size (e.g. ~144MB for flows alone on a
+     * 6000x6000 scene), especially since callers may invoke cuphu.unwrap()
+     * repeatedly within one process (e.g. once per frequency/polarization
+     * in the NISAR InSAR workflow). InitNetwork() guarantees nodes is
+     * allocated (Get2DMem, nrow-1 rows) by this point regardless of which
+     * init path ran, matching SNAPHU's own Free2DArray((void**)nodes,
+     * nrow-1) convention (snaphu.c). flows is always Get2DRowColMem'd
+     * (2*nrow-1 rows), by MSTInitFlows/MCFInitFlows/CalcFlow alike. */
+    Free2DArray((void **)flows, (unsigned int)(2 * tile_nrow - 1));
+    Free2DArray((void **)nodes, (unsigned int)(tile_nrow - 1));
 
     CUDA_CHECK(cudaStreamDestroy(stream));
     return 0;
@@ -1038,6 +1103,49 @@ int cuphu_unwrap(
             comp_offset += local_max;
         }
     }
+
+    /* ── optional single-tile reoptimization ─────────────────────────────
+     *
+     * cuPHU's own tile stitching above is a whole-tile bulk 2*pi offset
+     * (median over the overlap) propagated via a BFS spanning tree over
+     * tile adjacency -- meaningfully cruder than SNAPHU's own per-region
+     * secondary-network stitching, and with no loop-closure correction
+     * when the tile grid has cycles (any ntilerow>=2 and ntilecol>=2
+     * grid). This pass cleans that up: rerun a full CPU TreeSolve over the
+     * whole assembled scene as a single tile, seeded from the just-
+     * stitched result (see solve_tile()'s h_unw_seed_tile parameter),
+     * exactly analogous to SNAPHU's own SINGLETILEREOPTIMIZE / snaphu-py's
+     * single_tile_reoptimize. Also fixes, as an expected side effect (not
+     * an accident), the fact that connected-component labels are not
+     * otherwise merged across tile boundaries at all (comp_offset above
+     * just concatenates per-tile label spaces) -- conncomp gets fully
+     * recomputed over the assembled, re-solved scene here.
+     *
+     * Off by default: this is a full-scene CPU network-flow solve with
+     * the same cost profile as snaphu-py's single_tile_reoptimize, which
+     * is exactly what caused a real production job to hang for 4+ hours
+     * when it defaulted on. cuPHU defaults it off deliberately.
+     */
+    if (tile->single_tile_reoptimize && ntiles > 1) {
+        if (std::getenv("CUPHU_DEBUG"))
+            fprintf(stderr,
+                    "[cuphu] single_tile_reoptimize: running full-scene "
+                    "CPU TreeSolve seeded from stitched result (%dx%d)\n",
+                    nrow, ncol);
+
+        std::vector<float>    h_unw_reopt(npix);
+        std::vector<uint32_t> h_cc_reopt(npix);
+        solve_tile(
+            h_phase.data(), corr, mag, mask,
+            nrow, ncol,
+            cost_mode, init_meth, params, gpu_id,
+            h_unw_reopt.data(), h_cc_reopt.data(),
+            /*h_unw_seed_tile=*/result->unw);
+
+        std::memcpy(result->unw, h_unw_reopt.data(), npix * sizeof(float));
+        std::memcpy(result->conncomp, h_cc_reopt.data(), npix * sizeof(uint32_t));
+    }
+
     return 0;
 }
 

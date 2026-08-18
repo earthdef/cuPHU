@@ -135,6 +135,14 @@ extern "C" void cuphu_laplace_unwrap_gpu(
 extern "C" bool cuphu_incrcost_early_exit(
     const smoothcostT*, const short*, int, long, int, short*, short*, int*);
 
+extern "C" long cuphu_gpu_treesolve_pass(
+    const short *d_poscost, const short *d_negcost,
+    short *d_flows, int nrow, int ncol, int nflow, int max_rounds,
+    unsigned long long *d_dist_pred, unsigned long long *d_dist_pred_prev,
+    int *d_claimed,
+    unsigned char *d_unsettled, unsigned char *d_arc_used,
+    int *d_changed, int *d_n_canceled);
+
 /* ── default parameter tables ─────────────────────────────────────────────── */
 extern "C"
 void cuphu_default_params(CuPhuParams *p) {
@@ -316,6 +324,22 @@ static void flatten_flows(
             out[nrowcost + (size_t)r * (ncol - 1) + c] = flows[nrow - 1 + r][c];
 }
 
+/* ── inverse of flatten_flows(): scatter a flat arc array back into
+ * SNAPHU's flows[row][col] layout. Exact mirror of flatten_flows() above --
+ * keep the two in sync. */
+static void unflatten_flows(
+    const std::vector<short> &in, int nrow, int ncol,
+    short **flows)
+{
+    size_t nrowcost = (size_t)(nrow - 1) * ncol;
+    for (int r = 0; r < nrow - 1; ++r)
+        for (int c = 0; c < ncol; ++c)
+            flows[r][c] = in[(size_t)r * ncol + c];
+    for (int r = 0; r < nrow; ++r)
+        for (int c = 0; c < ncol - 1; ++c)
+            flows[nrow - 1 + r][c] = in[nrowcost + (size_t)r * (ncol - 1) + c];
+}
+
 /* ── single-tile solve ──────────────────────────────────────────────────── */
 /*
  * h_unw_seed_tile: optional, full-tile-sized (tile_nrow*tile_ncol) already-
@@ -323,7 +347,11 @@ static void flatten_flows(
  * this estimate via SNAPHU's own CalcFlow() (same math as SNAPHU's native
  * reopt path, snaphu_util.c) instead of MST/MCF/Laplace init -- the caller
  * is asking to *refine* an existing unwrapping (e.g. cuphu_unwrap()'s
- * single_tile_reoptimize pass), not solve from scratch.
+ * single_tile_reoptimize pass), not solve from scratch. Forces CPU
+ * TreeSolve for this call regardless of the size-based GPU-treesolve gate
+ * (see use_gpu_treesolve below) -- accuracy is the whole point of a seeded
+ * call, and the GPU treesolve kernel's accuracy gap was only characterized
+ * at exactly this scale (whole-scene, single-tile graphs).
  */
 static int solve_tile(
     const float          *h_phase_tile,
@@ -669,6 +697,46 @@ static int solve_tile(
                                    : "fail (TreeSolve runs)");
     }
 
+    /* ── GPU treesolve gating ──────────────────────────────────────────
+     *
+     * Default OFF, unconditionally. cuphu_gpu_treesolve_pass() has a known,
+     * unresolved accuracy gap (see cuphu_negcycle.cu's KNOWN ISSUE note --
+     * confirmed on real data: differing conncomp labels, ~0.6% total-cost
+     * gap vs CPU TreeSolve, not just an unproven-but-plausibly-fine kernel).
+     * It was originally motivated by a real bottleneck (a 6000x6000/36M-px
+     * single-tile solve spending ~94% of its wall time in CPU TreeSolve --
+     * see the single-tile-reoptimization investigation), but that bottleneck
+     * is now addressed on the CPU side instead (single_tile_reoptimize's
+     * seeded-flow reopt pass). Opt in ONLY for continued debugging/
+     * development of the kernel itself via CUPHU_GPU_TREESOLVE=1 -- never
+     * enable this for a real unwrap() call whose output will be trusted.
+     * (Previously defaulted on above a 300,000-pixel size threshold; that
+     * default silently exposed ordinary large single-tile solves --
+     * including cuphu.unwrap()'s own default ntiles=(1,1) for init='mcf'/
+     * 'mst' on scenes over ~550x550px -- to the known-wrong kernel with no
+     * warning. Fixed to default off during code review, 2026-08-17.)
+     */
+    bool use_gpu_treesolve = false;
+    if (const char *env = std::getenv("CUPHU_GPU_TREESOLVE"))
+        use_gpu_treesolve = (std::atoi(env) != 0);
+    if (cost_mode != CUPHU_COST_SMOOTH)
+        use_gpu_treesolve = false;  /* GPU cost kernel only covers smooth mode */
+    if (h_unw_seed_tile)
+        use_gpu_treesolve = false;  /* seeded (reopt) call: accuracy-critical,
+                                     * never honor the opt-in env var here --
+                                     * see cuphu_negcycle.cu's KNOWN ISSUE */
+
+    /* Scratch buffers for cuphu_gpu_treesolve_pass(), sized once per tile
+     * (nnode = interior grid nodes + one virtual ground node). Allocated
+     * lazily on first use inside the loop below so tiles that never take
+     * the GPU path (early-exit, or use_gpu_treesolve=false) pay nothing. */
+    DevArray<unsigned long long> d_dist_pred_arr, d_dist_pred_prev_arr;
+    DevArray<int>           d_claimed_arr;
+    DevArray<unsigned char> d_unsettled_arr, d_arc_used_arr;
+    DevArray<int>           d_ts_changed_arr, d_ts_ncanceled_arr;
+    bool ts_scratch_ready = false;
+    const int nnode_ts = (tile_nrow - 1) * (tile_ncol - 1) + 1;
+
     /* ── main solver loop (skipped when GPU early-exit passes) ───────── */
     if (!gpu_early_exit) {
         totalcostT oldtotalcost = totalcost;
@@ -679,31 +747,76 @@ static int solve_tile(
             SetupIncrFlowCosts(costs_pp, incrcosts, flows, nflow,
                                tile_nrow, narcrow, narcsperrow, &sp);
 
-            nodeT **sourcelist   = nullptr;
-            long  *nconnectedarr = nullptr;
-            long nsource = SelectSources(
-                nodes, mag_pp, &ground, nflow, flows, ngroundarcs,
-                tile_nrow, tile_ncol, &sp, &sourcelist, &nconnectedarr);
-
-            SetupTreeSolveNetwork(nodes, &ground, apexes, iscandidate,
-                                  nnoderow, nnodesperrow, narcrow, narcsperrow,
-                                  tile_nrow, tile_ncol);
-
             long n = 0;
-            for (long isrc = 0; isrc < nsource; ++isrc) {
-                nodeT *source = sourcelist[isrc];
-                n += TreeSolve(nodes, nullptr, &ground, source,
-                               &candidatelist, &candidatebag,
-                               &candidatelistsize, &candidatebagsize,
-                               bkts, flows, costs_pp, incrcosts, apexes,
-                               iscandidate, ngroundarcs, nflow,
-                               mag_pp, phase_pp, (char *)"",
-                               nnoderow, nnodesperrow, narcrow, narcsperrow,
-                               tile_nrow, tile_ncol, &outfiles,
-                               nconnectedarr[isrc], &sp);
+
+            if (use_gpu_treesolve) {
+                if (!ts_scratch_ready) {
+                    d_dist_pred_arr      = DevArray<unsigned long long>((size_t)nnode_ts);
+                    d_dist_pred_prev_arr = DevArray<unsigned long long>((size_t)nnode_ts);
+                    d_claimed_arr      = DevArray<int>((size_t)nnode_ts);
+                    d_unsettled_arr    = DevArray<unsigned char>((size_t)nnode_ts);
+                    d_arc_used_arr     = DevArray<unsigned char>((size_t)ncost_total * 2);
+                    d_ts_changed_arr   = DevArray<int>(1u);
+                    d_ts_ncanceled_arr = DevArray<int>(1u);
+                    ts_scratch_ready = true;
+                }
+
+                /* Recompute poscost/negcost for the CURRENT nflow (this
+                 * kernel already takes nflow as a runtime parameter --
+                 * only the call site was hardcoded to 1 before; ignore
+                 * the early-exit bool return, we just want the arrays). */
+                std::vector<short> h_flows_flat_gpu;
+                flatten_flows(flows, tile_nrow, tile_ncol, h_flows_flat_gpu);
+                CUDA_CHECK(cudaMemcpy(d_flows_flat_arr.get(), h_flows_flat_gpu.data(),
+                                      h_flows_flat_gpu.size() * sizeof(short),
+                                      cudaMemcpyHostToDevice));
+                (void)cuphu_incrcost_early_exit(
+                    d_smooth_costs, d_flows_flat_arr.get(),
+                    (int)ncost_total, sp.nshortcycle, (int)nflow,
+                    d_poscost_arr.get(), d_negcost_arr.get(), d_scratch_arr.get());
+
+                n = cuphu_gpu_treesolve_pass(
+                    d_poscost_arr.get(), d_negcost_arr.get(),
+                    d_flows_flat_arr.get(), tile_nrow, tile_ncol, (int)nflow,
+                    /*max_rounds=*/nnode_ts,
+                    d_dist_pred_arr.get(), d_dist_pred_prev_arr.get(),
+                    d_claimed_arr.get(), d_unsettled_arr.get(), d_arc_used_arr.get(),
+                    d_ts_changed_arr.get(), d_ts_ncanceled_arr.get());
+
+                d_flows_flat_arr.to_host(h_flows_flat_gpu.data());
+                unflatten_flows(h_flows_flat_gpu, tile_nrow, tile_ncol, flows);
+
+                if (std::getenv("CUPHU_DEBUG"))
+                    fprintf(stderr,
+                            "[cuphu] GPU treesolve (tile=%dx%d, nflow=%ld): "
+                            "%ld cycle(s) canceled\n",
+                            tile_nrow, tile_ncol, nflow, n);
+            } else {
+                nodeT **sourcelist   = nullptr;
+                long  *nconnectedarr = nullptr;
+                long nsource = SelectSources(
+                    nodes, mag_pp, &ground, nflow, flows, ngroundarcs,
+                    tile_nrow, tile_ncol, &sp, &sourcelist, &nconnectedarr);
+
+                SetupTreeSolveNetwork(nodes, &ground, apexes, iscandidate,
+                                      nnoderow, nnodesperrow, narcrow, narcsperrow,
+                                      tile_nrow, tile_ncol);
+
+                for (long isrc = 0; isrc < nsource; ++isrc) {
+                    nodeT *source = sourcelist[isrc];
+                    n += TreeSolve(nodes, nullptr, &ground, source,
+                                   &candidatelist, &candidatebag,
+                                   &candidatelistsize, &candidatebagsize,
+                                   bkts, flows, costs_pp, incrcosts, apexes,
+                                   iscandidate, ngroundarcs, nflow,
+                                   mag_pp, phase_pp, (char *)"",
+                                   nnoderow, nnodesperrow, narcrow, narcsperrow,
+                                   tile_nrow, tile_ncol, &outfiles,
+                                   nconnectedarr[isrc], &sp);
+                }
+                std::free(sourcelist);
+                std::free(nconnectedarr);
             }
-            std::free(sourcelist);
-            std::free(nconnectedarr);
 
             ncycle    += n;
             nflowdone  = (n <= sp.maxnflowcycles) ? nflowdone + 1 : 1;
@@ -724,7 +837,46 @@ static int solve_tile(
         if (std::getenv("CUPHU_DEBUG")) {
             totalcostT finalcost = EvaluateTotalCost(
                 costs_pp, flows, tile_nrow, tile_ncol, narcsperrow, &sp);
-            fprintf(stderr, "[cuphu] final total cost: %.16g\n", (double)finalcost);
+            fprintf(stderr,
+                    "[cuphu] final total cost (%s path): %.16g\n",
+                    use_gpu_treesolve ? "GPU" : "CPU", (double)finalcost);
+        }
+
+        /* Debug-only: dump the final flat flows[] array (same layout as
+         * flatten_flows()) plus the arc costs, so a CPU-run and a GPU-run
+         * can be diffed arc-by-arc from Python. Path prefix from
+         * CUPHU_DEBUG_DUMP_FLOWS; ".cpu"/".gpu" + ".meta"/".flows"/
+         * ".poscost"/".negcost" suffixes appended. */
+        if (const char *dump_prefix = std::getenv("CUPHU_DEBUG_DUMP_FLOWS")) {
+            std::string tag = use_gpu_treesolve ? "gpu" : "cpu";
+            std::vector<short> h_dump_flows;
+            flatten_flows(flows, tile_nrow, tile_ncol, h_dump_flows);
+
+            std::string meta_path = std::string(dump_prefix) + "." + tag + ".meta";
+            FILE *fmeta = fopen(meta_path.c_str(), "w");
+            if (fmeta) {
+                fprintf(fmeta, "%d %d %zu\n", tile_nrow, tile_ncol, h_dump_flows.size());
+                fclose(fmeta);
+            }
+            std::string flows_path = std::string(dump_prefix) + "." + tag + ".flows";
+            FILE *fflows = fopen(flows_path.c_str(), "wb");
+            if (fflows) {
+                fwrite(h_dump_flows.data(), sizeof(short), h_dump_flows.size(), fflows);
+                fclose(fflows);
+            }
+            if (cost_mode == CUPHU_COST_SMOOTH && d_smooth_costs != nullptr) {
+                std::vector<short> h_dump_pos(ncost_total), h_dump_neg(ncost_total);
+                d_poscost_arr.to_host(h_dump_pos.data());
+                d_negcost_arr.to_host(h_dump_neg.data());
+                std::string pos_path = std::string(dump_prefix) + "." + tag + ".poscost";
+                std::string neg_path = std::string(dump_prefix) + "." + tag + ".negcost";
+                FILE *fpos = fopen(pos_path.c_str(), "wb");
+                if (fpos) { fwrite(h_dump_pos.data(), sizeof(short), ncost_total, fpos); fclose(fpos); }
+                FILE *fneg = fopen(neg_path.c_str(), "wb");
+                if (fneg) { fwrite(h_dump_neg.data(), sizeof(short), ncost_total, fneg); fclose(fneg); }
+            }
+            fprintf(stderr, "[cuphu] dumped flows/costs to %s.%s.*\n",
+                    dump_prefix, tag.c_str());
         }
 
         /* TreeSolve changed `flows`, so d_poscost_arr/d_negcost_arr (computed

@@ -56,6 +56,7 @@ set(CUPHU_CUDA_SOURCES
   ${CUDA_SRC_DIR}/cuphu_cost.cu
   ${CUDA_SRC_DIR}/cuphu_phase.cu
   ${CUDA_SRC_DIR}/cuphu_conncomp.cu
+  ${CUDA_SRC_DIR}/cuphu_bridge_gpu.cu
   ${CUDA_SRC_DIR}/cuphu_incrcost.cu
   ${CUDA_SRC_DIR}/cuphu_negcycle.cu
   ${CUDA_SRC_DIR}/cuphu_laplace.cu

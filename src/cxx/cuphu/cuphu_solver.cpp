@@ -232,6 +232,17 @@ void cuphu_default_tile_params(CuPhuTileParams *tp) {
     tp->nproc          = 1;
     tp->ngpustreams    = 2;
     tp->single_tile_reoptimize = 0;
+    tp->laplace_neighbor_feedback = 0;
+    tp->laplace_neighbor_feedback_feather = 200;
+}
+
+void cuphu_default_bridge_params(CuPhuBridgeParams *bp) {
+    std::memset(bp, 0, sizeof(*bp));
+    bp->enabled              = 0;
+    bp->radius               = 500;
+    bp->min_num_pixel        = 14;
+    bp->erosion_size         = 2;
+    bp->max_boundary_samples = 4096;
 }
 
 /* ── translate CuPhuParams → SNAPHU's paramT ─────────────────────────── */
@@ -448,12 +459,21 @@ static int solve_tile(
         CUDA_CHECK(cudaStreamSynchronize(stream));
         TOCK("GPU cost compute (no D2H)");
 
+        /* CUPHU_LAPLACE_MAX_ITER / CUPHU_LAPLACE_TOL: env-var overrides for
+         * quick convergence experiments (seam-diagnosis work), not a public
+         * API -- remove once resolved. */
+        int   lap_max_iter = 1000;
+        float lap_tol      = 1e-3f;
+        if (const char *e = std::getenv("CUPHU_LAPLACE_MAX_ITER")) lap_max_iter = std::atoi(e);
+        if (const char *e = std::getenv("CUPHU_LAPLACE_TOL"))      lap_tol      = std::atof(e);
+        bool lap_verbose = std::getenv("CUPHU_LAPLACE_VERBOSE") != nullptr;
+
         DevArray<float> d_unw_lap(npix);
         cuphu_laplace_unwrap_gpu(
             d_smooth_costs, d_phase.get(),
             tile_nrow, tile_ncol,
             params->nshortcycle,
-            /*max_iter=*/1000, /*tol=*/1e-3f, /*verbose=*/0,
+            lap_max_iter, lap_tol, lap_verbose ? 1 : 0,
             d_unw_lap.get(), stream);
         TOCK("GPU Laplace PCG");
 
@@ -970,6 +990,475 @@ static int solve_tile(
 }
 
 /* ── main public entry point ─────────────────────────────────────────────── */
+/* ── phase bridging: native port of isce3's bridge_unwrapped_phase() ─────
+ *
+ * Reconciles whole-2*pi offsets between disconnected regions of unwrapped
+ * phase (e.g. regions split apart by a water mask). Pixel-scale stages
+ * (8-connectivity labeling, erosion pruning, boundary extraction, nearest-
+ * opposite-region search) run on GPU via cuphu_bridge_gpu.cu; region-scale
+ * stages (MST, BFS, per-bridge median, cumulative correction bookkeeping)
+ * run here on CPU, directly mirroring the tile-stitching BFS/median code
+ * a few hundred lines above (horiz_k/vert_k, the tile_k BFS) generalized
+ * from grid adjacency to a general graph over regions.
+ *
+ * Validated stage-by-stage against scipy/CPU-brute-force references before
+ * being wired in here; see the phase-bridging plan for the verification
+ * matrix. This function itself was validated as a CPU-only algorithm
+ * skeleton (before any GPU kernel existed) against synthetic fixtures with
+ * known injected 2*pi offsets, including a multi-hop MST chain and the
+ * degenerate already-single-region no-op case.
+ */
+
+/* boundary points per region beyond this cap are uniformly subsampled --
+ * mirrors isce3's own deramp_max_num_sample philosophy. Not currently
+ * exposed as a tunable beyond CuPhuBridgeParams::max_boundary_samples. */
+static constexpr int BRIDGE_NN_MAX_RING = 64;
+
+/* remove regions smaller than min_num_pixel, relabel compactly 1..N */
+static int bridge_prune_small_regions(
+    std::vector<uint32_t> &labels, int num_label, int min_num_pixel
+) {
+    std::vector<int> count(num_label + 1, 0);
+    for (auto l : labels) if (l != 0) count[l]++;
+    std::vector<int> remap(num_label + 1, 0);
+    int next_label = 1;
+    for (int i = 1; i <= num_label; ++i)
+        if (count[i] >= min_num_pixel) remap[i] = next_label++;
+    for (auto &l : labels) if (l != 0) l = (uint32_t)remap[l];
+    return next_label - 1;
+}
+
+/* reference region: largest by pixel count (sanctioned simplification vs
+ * isce3's label-value-bbox-sum heuristic -- affects only which region ends
+ * up as the fixed global constant, not relative region-to-region offsets) */
+static int bridge_find_reference_region(
+    const std::vector<uint32_t> &labels, int num_label
+) {
+    std::vector<int> count(num_label + 1, 0);
+    for (auto l : labels) if (l != 0) count[l]++;
+    int best = 1;
+    for (int i = 2; i <= num_label; ++i)
+        if (count[i] > count[best]) best = i;
+    return best;
+}
+
+struct BridgeEdge { int label0, label1, y0, x0, y1, x1; };
+
+/* Prim's MST over the (small, N<=~1000) region distance matrix, then BFS
+ * from label_ref -- mirrors the tile_k BFS above exactly, generalized from
+ * grid adjacency to a general graph. Missing/unreachable pairs (distmat
+ * entry < 0, from the GPU search's max_ring cap) are treated as +inf. */
+static std::vector<BridgeEdge> bridge_prim_mst_bfs(
+    const std::vector<float> &distmat, int num_label, int label_ref,
+    const std::vector<int> &endpoints
+) {
+    int n1 = num_label + 1;
+    auto D = [&](int i, int j) -> float {
+        float d = distmat[i * n1 + j];
+        return d < 0 ? std::numeric_limits<float>::infinity() : d;
+    };
+
+    std::vector<bool> in_mst(n1, false);
+    std::vector<float> best_dist(n1, std::numeric_limits<float>::infinity());
+    std::vector<int> best_parent(n1, -1);
+    in_mst[label_ref] = true;
+    for (int j = 1; j <= num_label; ++j) {
+        if (j == label_ref) continue;
+        best_dist[j] = D(label_ref, j);
+        best_parent[j] = label_ref;
+    }
+
+    std::vector<std::pair<int,int>> mst_edges;   /* (parent, child) */
+    for (int iter = 1; iter < num_label; ++iter) {
+        int u = -1;
+        float ud = std::numeric_limits<float>::infinity();
+        for (int j = 1; j <= num_label; ++j)
+            if (!in_mst[j] && best_dist[j] < ud) { ud = best_dist[j]; u = j; }
+        if (u == -1) break;   /* remaining regions unreachable within max_ring */
+        in_mst[u] = true;
+        mst_edges.push_back({best_parent[u], u});
+        for (int j = 1; j <= num_label; ++j) {
+            if (in_mst[j]) continue;
+            float d = D(u, j);
+            if (d < best_dist[j]) { best_dist[j] = d; best_parent[j] = u; }
+        }
+    }
+
+    /* adjacency list over MST edges, then BFS from label_ref for
+     * parent-before-child bridge ordering (mirrors tile_k BFS) */
+    std::vector<std::vector<int>> adj(n1);
+    for (auto &e : mst_edges) { adj[e.first].push_back(e.second); adj[e.second].push_back(e.first); }
+
+    std::vector<BridgeEdge> bridges;
+    std::vector<bool> visited(n1, false);
+    std::queue<int> bfs;
+    bfs.push(label_ref);
+    visited[label_ref] = true;
+    while (!bfs.empty()) {
+        int u = bfs.front(); bfs.pop();
+        for (int v : adj[u]) {
+            if (visited[v]) continue;
+            visited[v] = true;
+            int y0 = endpoints[4 * (u * n1 + v) + 0];
+            int x0 = endpoints[4 * (u * n1 + v) + 1];
+            int y1 = endpoints[4 * (u * n1 + v) + 2];
+            int x1 = endpoints[4 * (u * n1 + v) + 3];
+            bridges.push_back({u, v, y0, x0, y1, x1});
+            bfs.push(v);
+        }
+    }
+    return bridges;
+}
+
+/* AOI-window median unwrapped phase for `region_id`, centered at (cy,cx) --
+ * mirrors horiz_k/vert_k's nth_element technique above. */
+static bool bridge_region_median(
+    const float *unw, const std::vector<uint32_t> &labels,
+    int nrow, int ncol, int cy, int cx, int radius, uint32_t region_id,
+    double &median_out
+) {
+    int r0 = std::max(0, cy - radius), r1 = std::min(nrow, cy + radius + 1);
+    int c0 = std::max(0, cx - radius), c1 = std::min(ncol, cx + radius + 1);
+    std::vector<float> vals;
+    vals.reserve((size_t)(r1 - r0) * (c1 - c0));
+    for (int r = r0; r < r1; ++r)
+        for (int c = c0; c < c1; ++c) {
+            size_t idx = (size_t)r * ncol + c;
+            if (labels[idx] == region_id) vals.push_back(unw[idx]);
+        }
+    if (vals.empty()) return false;
+    auto mid = vals.begin() + vals.size() / 2;
+    std::nth_element(vals.begin(), mid, vals.end());
+    median_out = *mid;
+    return true;
+}
+
+/* top-level orchestrator: GPU labeling/erosion/boundary/NN-search stages,
+ * CPU MST/BFS/median/apply -- overwrites both unw (in place) and conncomp
+ * (with fresh bridging labels: bridging's regions are validity islands,
+ * not SNAPHU's confidence-based conncomp, so they supersede it here).
+ *
+ * isce3's bridge_unwrapped_phase() assumes invalid pixels are literally
+ * unw == 0 -- true in the isce3 pipeline because the RUNW-writing step
+ * zeros masked pixels before bridging ever sees the array. cuPHU's own
+ * solved unw has no such guarantee (masked pixels still carry whatever
+ * phase value TreeSolve/Laplace produced there; `mask` only gates
+ * cost/conncomp, not the phase array itself) -- so when a mask is
+ * available, a LOCAL zeroed copy is built purely to drive connectivity
+ * topology (labeling/erosion/boundary/NN-search); the actual median/apply
+ * steps still read/write the real unw values, so masked pixels' original
+ * phase is left untouched (they simply aren't part of any bridging
+ * region, matching labels==0 there). */
+static void apply_phase_bridging(
+    float *unw, uint32_t *conncomp, int nrow, int ncol,
+    const CuPhuBridgeParams *bp, const unsigned char *mask, int gpu_id
+) {
+    size_t npix = (size_t)nrow * ncol;
+
+    std::vector<float> unw_topology;
+    const float *unw_for_labeling = unw;
+    if (mask) {
+        unw_topology.assign(unw, unw + npix);
+        for (size_t i = 0; i < npix; ++i)
+            if (mask[i] == 0) unw_topology[i] = 0.0f;
+        unw_for_labeling = unw_topology.data();
+    }
+
+    std::vector<uint32_t> labels(npix);
+    int num_label = 0;
+    cuphu_bridge_label_gpu(unw_for_labeling, nrow, ncol, gpu_id, labels.data(), &num_label);
+    if (num_label <= 1) return;
+
+    num_label = bridge_prune_small_regions(labels, num_label, bp->min_num_pixel);
+    if (num_label <= 1) return;
+
+    cuphu_bridge_erode_prune_gpu(labels.data(), nrow, ncol, num_label,
+                                 bp->erosion_size, /*circular=*/0, gpu_id, &num_label);
+    if (num_label <= 1) return;
+    cuphu_bridge_erode_prune_gpu(labels.data(), nrow, ncol, num_label,
+                                 bp->erosion_size, /*circular=*/1, gpu_id, &num_label);
+    if (num_label <= 1) return;
+
+    int label_ref = bridge_find_reference_region(labels, num_label);
+
+    std::vector<uint8_t> boundary(npix);
+    cuphu_bridge_boundary_gpu(labels.data(), nrow, ncol, gpu_id, boundary.data());
+
+    int n1 = num_label + 1;
+    std::vector<float> distmat((size_t)n1 * n1);
+    std::vector<int> endpoints((size_t)n1 * n1 * 4);
+    cuphu_bridge_nn_distmat_gpu(
+        labels.data(), boundary.data(), nrow, ncol, num_label,
+        bp->max_boundary_samples, BRIDGE_NN_MAX_RING, gpu_id,
+        distmat.data(), endpoints.data());
+
+    std::vector<BridgeEdge> bridges =
+        bridge_prim_mst_bfs(distmat, num_label, label_ref, endpoints);
+
+    int radius = std::min(bp->radius, std::min(nrow, ncol) / 2);
+    std::vector<double> corr(num_label + 1, 0.0);
+    for (auto &br : bridges) {
+        double m0, m1;
+        bool ok0 = bridge_region_median(unw, labels, nrow, ncol, br.y0, br.x0,
+                                        radius, (uint32_t)br.label0, m0);
+        bool ok1 = bridge_region_median(unw, labels, nrow, ncol, br.y1, br.x1,
+                                        radius, (uint32_t)br.label1, m1);
+        if (!ok0 || !ok1) continue;
+        double diff = m1 - (m0 + corr[br.label0]);
+        double num_jump = std::floor((std::fabs(diff) + M_PI) / (2.0 * M_PI));
+        if (diff > 0) num_jump *= -1.0;
+        corr[br.label1] = num_jump * (2.0 * M_PI);
+    }
+
+    if (std::getenv("CUPHU_DEBUG"))
+        fprintf(stderr, "[cuphu] bridge: %d regions, %zu bridges applied\n",
+                num_label, bridges.size());
+
+    for (size_t idx = 0; idx < npix; ++idx) {
+        uint32_t l = labels[idx];
+        conncomp[idx] = l;   /* bridging's regions supersede conncomp entirely */
+        if (l == 0) continue;
+        unw[idx] += (float)corr[l];
+    }
+}
+
+/* test-only entry point: exercises the exact same wired pipeline
+ * cuphu_unwrap() calls, on a caller-supplied unw+conncomp array directly
+ * (skipping the igram solve) -- lets integration tests feed the same
+ * synthetic constant-offset fixtures used to validate the CPU-only
+ * algorithm skeleton through the real GPU-backed orchestrator. */
+extern "C"
+void cuphu_bridge_apply_test(
+    float *unw, uint32_t *conncomp, int nrow, int ncol,
+    const CuPhuBridgeParams *bp, const unsigned char *mask, int gpu_id
+) {
+    apply_phase_bridging(unw, conncomp, nrow, ncol, bp, mask, gpu_id);
+}
+
+/* ── Laplace neighbor-feedback boundary refinement ────────────────────────
+ *
+ * The whole-tile bulk-offset stitching (tile_k via horiz_k/vert_k above)
+ * corrects a single constant per tile -- exact for MCF/MST (network-flow
+ * circulation guarantees an integer-cycle-consistent whole-tile offset),
+ * but only an approximation for Laplace: independently-solved PCG tiles
+ * can show a genuinely position-varying (not just tile-constant) mismatch
+ * along their shared boundary in marginal-coherence areas. Confirmed on
+ * real data via row-by-row inspection: a clean, low-noise ~9 rad step
+ * localized to a handful of specific rows, absent at neighboring rows --
+ * not explainable by a whole-tile rounding/registration error.
+ *
+ * This refines each internal tile boundary with a smoothly-varying
+ * (per-row for column boundaries, per-column for row boundaries) residual
+ * correction on top of the already-applied whole-tile offset, feathered to
+ * zero over feather_px moving away from the boundary into the tile
+ * interior. A moving-median smooth of the raw per-row/per-col overlap
+ * diff keeps the correction robust to individual noisy pixels while still
+ * tracking real localized bias (mirrors this session's crop-level
+ * validation: exact per-row correction cut median mismatch ~55%, mean
+ * ~44%; smoothing trades a little of that for robustness).
+ *
+ * Off by default; only meaningful for init_meth == CUPHU_INIT_LAPLACE
+ * (MCF/MST's whole-tile offset is already exact, so this would only add
+ * noise there -- callers should not enable it outside Laplace).
+ */
+static void apply_laplace_neighbor_feedback(
+    float *unw, const unsigned char *mask, int nrow, int ncol,
+    int ntr, int ntc, int row_ovrlp, int col_ovrlp, int feather_px
+) {
+    if (feather_px <= 0) return;
+
+    auto tile_first_row = [&](int tr) { return (int)((long)tr * (nrow - row_ovrlp) / ntr); };
+    auto tile_first_col = [&](int tc) { return (int)((long)tc * (ncol - col_ovrlp) / ntc); };
+    auto valid = [&](size_t gi) { return !mask || mask[gi] != 0; };
+
+    /* SAMPLE_HALF=1: use only the single pixel immediately adjacent to the
+     * boundary on each side, not a wider window. A wider window's median
+     * is a more noise-robust *neighborhood* estimate, but introduces a
+     * systematic bias whenever real signal has a local gradient across
+     * that window (the median represents the window's middle, not the
+     * pixel actually at the boundary) -- confirmed empirically: a 3px
+     * window improved the wider-neighborhood match but made the single
+     * tightest boundary-pixel-pair mismatch worse (the actual seam metric
+     * used throughout this investigation). Row-direction smoothing below
+     * still provides the noise robustness a wider spatial window would
+     * have added, without that bias. */
+    static const int SAMPLE_HALF = 1;
+    static const int SMOOTH_WIN  = 21; /* moving-median window over the raw diff profile */
+
+    auto moving_median = [](std::vector<double> &x, const std::vector<uint8_t> &have, int w) {
+        int n = (int)x.size();
+        std::vector<double> out(n, 0.0);
+        int half = w / 2;
+        std::vector<double> seg;
+        for (int i = 0; i < n; ++i) {
+            if (!have[i]) continue;
+            int lo = std::max(0, i - half), hi = std::min(n, i + half + 1);
+            seg.clear();
+            for (int j = lo; j < hi; ++j) if (have[j]) seg.push_back(x[j]);
+            if (seg.empty()) { out[i] = x[i]; continue; }
+            std::nth_element(seg.begin(), seg.begin() + seg.size() / 2, seg.end());
+            out[i] = seg[seg.size() / 2];
+        }
+        x.swap(out);
+    };
+
+    /* Rows/columns whose boundary-adjacent pixels are both valid
+     * (`have[i]==1`) get a directly-measured correction; the rest -- common
+     * wherever the boundary crosses mostly-water with only sparse islands
+     * poking through -- had none at all before this fix, which left the
+     * *applied* correction jumping between a real value and zero from one
+     * row to the next right at a measured cluster's edge (visible as a
+     * sharp band there). An earlier version of this fix filled every gap
+     * by linear interpolation, unbounded in distance -- correct for the
+     * small gaps between nearby measurements (e.g. within one cluster of
+     * islands), but on real data, one island's single-pixel measurement
+     * could be the *only* evidence for hundreds or thousands of rows of
+     * open water, and interpolating (or edge-holding) across that whole
+     * span turned one noisy sample into a fabricated multi-radian drift
+     * with no local support -- confirmed on a real scene where this
+     * produced a visible band spanning ~250 rows of pure water fed by one
+     * 16-row island cluster.
+     *
+     * Fixed by bounding how far a measurement is trusted to reach, via
+     * MAX_FILL (reusing SMOOTH_WIN's implicit "local neighborhood" scale,
+     * doubled): within that many rows of the nearest measurement, fade the
+     * correction smoothly to zero rather than holding or interpolating
+     * across it; a gap wider than 2*MAX_FILL leaves a true zero-correction
+     * region in the middle where neither side's evidence reaches. This
+     * mirrors feather_px's own logic (a correction's influence must decay
+     * with distance from where it's actually justified), just along the
+     * boundary instead of into the tile. */
+    static const int MAX_FILL = 2 * SMOOTH_WIN;
+
+    auto fill_gaps = [](std::vector<double> &x, std::vector<uint8_t> &have, int max_fill) {
+        int n = (int)x.size();
+        std::vector<int> idx;
+        idx.reserve(n);
+        for (int i = 0; i < n; ++i) if (have[i]) idx.push_back(i);
+        if (idx.empty()) return;
+
+        std::vector<double> out(n, 0.0);
+        std::vector<uint8_t> out_have(n, 0);
+
+        auto fade_from = [&](int src, int i) {
+            int d = std::abs(i - src);
+            double w = 1.0 - (double)d / (double)max_fill;
+            out[i] = x[src] * w;
+            out_have[i] = 1;
+        };
+
+        for (int i = std::max(0, idx.front() - max_fill); i < idx.front(); ++i)
+            fade_from(idx.front(), i);
+        for (int i = idx.back() + 1; i < std::min(n, idx.back() + 1 + max_fill); ++i)
+            fade_from(idx.back(), i);
+
+        for (size_t k = 0; k + 1 < idx.size(); ++k) {
+            int a = idx[k], b = idx[k + 1];
+            int gap = b - a;
+            double va = x[a], vb = x[b];
+            if (gap <= 2 * max_fill) {
+                for (int i = a + 1; i < b; ++i) {
+                    double t = (double)(i - a) / (double)gap;
+                    out[i] = va + t * (vb - va);
+                    out_have[i] = 1;
+                }
+            } else {
+                for (int i = a + 1; i <= a + max_fill; ++i) fade_from(a, i);
+                for (int i = b - max_fill; i < b; ++i) fade_from(b, i);
+            }
+        }
+        for (int i : idx) { out[i] = x[i]; out_have[i] = 1; }
+
+        x.swap(out);
+        have.swap(out_have);
+    };
+
+    /* ── internal column boundaries (horizontally-adjacent tiles):
+     * correction varies per ROW ─────────────────────────────────────── */
+    for (int tc = 1; tc < ntc; ++tc) {
+        int bc = tile_first_col(tc) + col_ovrlp / 2;
+        if (bc - SAMPLE_HALF < 0 || bc + SAMPLE_HALF >= ncol) continue;
+
+        std::vector<double> diff(nrow, 0.0);
+        std::vector<uint8_t> have(nrow, 0);
+        std::vector<float> lv, rv;
+        for (int r = 0; r < nrow; ++r) {
+            lv.clear(); rv.clear();
+            for (int k = 1; k <= SAMPLE_HALF; ++k) {
+                size_t lp = (size_t)r * ncol + (bc - k);
+                size_t rp = (size_t)r * ncol + (bc - 1 + k);
+                if (valid(lp)) lv.push_back(unw[lp]);
+                if (valid(rp)) rv.push_back(unw[rp]);
+            }
+            if (lv.empty() || rv.empty()) continue;
+            std::nth_element(lv.begin(), lv.begin() + lv.size() / 2, lv.end());
+            std::nth_element(rv.begin(), rv.begin() + rv.size() / 2, rv.end());
+            diff[r] = (double)lv[lv.size() / 2] - (double)rv[rv.size() / 2];
+            have[r] = 1;
+        }
+        moving_median(diff, have, SMOOTH_WIN);
+        fill_gaps(diff, have, MAX_FILL);
+
+        int c1 = std::min(ncol, bc + feather_px);
+        for (int r = 0; r < nrow; ++r) {
+            if (!have[r]) continue;
+            for (int c = bc; c < c1; ++c) {
+                size_t gi = (size_t)r * ncol + c;
+                if (!valid(gi)) continue;
+                float w = 1.0f - (float)(c - bc) / (float)feather_px;
+                unw[gi] += (float)(diff[r] * w);
+            }
+        }
+    }
+
+    /* ── internal row boundaries (vertically-adjacent tiles): correction
+     * varies per COLUMN -- mirror of the above ──────────────────────── */
+    for (int tr = 1; tr < ntr; ++tr) {
+        int br = tile_first_row(tr) + row_ovrlp / 2;
+        if (br - SAMPLE_HALF < 0 || br + SAMPLE_HALF >= nrow) continue;
+
+        std::vector<double> diff(ncol, 0.0);
+        std::vector<uint8_t> have(ncol, 0);
+        std::vector<float> tv, bv;
+        for (int c = 0; c < ncol; ++c) {
+            tv.clear(); bv.clear();
+            for (int k = 1; k <= SAMPLE_HALF; ++k) {
+                size_t tp = (size_t)(br - k) * ncol + c;
+                size_t bp = (size_t)(br - 1 + k) * ncol + c;
+                if (valid(tp)) tv.push_back(unw[tp]);
+                if (valid(bp)) bv.push_back(unw[bp]);
+            }
+            if (tv.empty() || bv.empty()) continue;
+            std::nth_element(tv.begin(), tv.begin() + tv.size() / 2, tv.end());
+            std::nth_element(bv.begin(), bv.begin() + bv.size() / 2, bv.end());
+            diff[c] = (double)tv[tv.size() / 2] - (double)bv[bv.size() / 2];
+            have[c] = 1;
+        }
+        moving_median(diff, have, SMOOTH_WIN);
+        fill_gaps(diff, have, MAX_FILL);
+
+        int r1 = std::min(nrow, br + feather_px);
+        for (int c = 0; c < ncol; ++c) {
+            if (!have[c]) continue;
+            for (int r = br; r < r1; ++r) {
+                size_t gi = (size_t)r * ncol + c;
+                if (!valid(gi)) continue;
+                float w = 1.0f - (float)(r - br) / (float)feather_px;
+                unw[gi] += (float)(diff[c] * w);
+            }
+        }
+    }
+}
+
+extern "C"
+void cuphu_laplace_neighbor_feedback_test(
+    float *unw, const unsigned char *mask, int nrow, int ncol,
+    int ntr, int ntc, int row_ovrlp, int col_ovrlp, int feather_px
+) {
+    apply_laplace_neighbor_feedback(unw, mask, nrow, ncol, ntr, ntc,
+                                    row_ovrlp, col_ovrlp, feather_px);
+}
+
 extern "C"
 int cuphu_unwrap(
     const float           *igram_r,
@@ -983,10 +1472,16 @@ int cuphu_unwrap(
     CuPhuInitMethod     init_meth,
     const CuPhuParams  *params,
     const CuPhuTileParams *tile,
+    const CuPhuBridgeParams *bridge,
+    const unsigned char   *orig_mask,
     int                    gpu_id,
     CuPhuResult        *result
 ) {
     CUDA_CHECK(cudaSetDevice(gpu_id));
+
+    /* tile-stitching confidence mask: the real, un-padded validity --
+     * see cuphu.h's cuphu_unwrap() docstring for orig_mask. */
+    const unsigned char *conf_mask = orig_mask ? orig_mask : mask;
 
     size_t npix = (size_t)nrow * ncol;
 
@@ -1011,6 +1506,8 @@ int cuphu_unwrap(
             nrow, ncol,
             cost_mode, init_meth, params, gpu_id,
             result->unw, result->conncomp);
+        if (bridge && bridge->enabled)
+            apply_phase_bridging(result->unw, result->conncomp, nrow, ncol, bridge, mask, gpu_id);
         return 0;
     }
 
@@ -1035,6 +1532,7 @@ int cuphu_unwrap(
         std::vector<float>   phase, corr_t;
         std::vector<float>   mag_t;
         std::vector<uint8_t> mask_t;
+        std::vector<uint8_t> conf_mask_t;  /* see conf_mask above */
         /* outputs */
         std::vector<float>    unw;
         std::vector<uint32_t> cc;
@@ -1060,6 +1558,7 @@ int cuphu_unwrap(
             tw.corr_t.resize(tnpix);
             if (mag)  tw.mag_t.resize(tnpix);
             if (mask) tw.mask_t.resize(tnpix);
+            if (conf_mask) tw.conf_mask_t.resize(tnpix);
             tw.unw.resize(tnpix);
             tw.cc.resize(tnpix);
 
@@ -1073,6 +1572,7 @@ int cuphu_unwrap(
                     tw.corr_t[ti] = corr[gi];
                     if (mag)  tw.mag_t[ti]  = mag[gi];
                     if (mask) tw.mask_t[ti] = mask[gi];
+                    if (conf_mask) tw.conf_mask_t[ti] = conf_mask[gi];
                 }
             }
         }
@@ -1113,7 +1613,25 @@ int cuphu_unwrap(
      * pixels, negligible vs. the GPU tile solve).  nth_element gives O(n)
      * median without sorting.
      */
-    std::vector<int> tile_k(ntiles, 0);   /* integer 2π offset per tile */
+    /* 2π-cycle offset per tile, accumulated via BFS below.  MCF/MST tiles
+     * are network-flow solves with exact integer-cycle circulation, so
+     * neighboring tiles differ by a provably whole number of 2π cycles --
+     * rounding horiz_k/vert_k's median-overlap-diff to the nearest integer
+     * is exact there.  Laplace tiles are an independent continuous PCG
+     * relaxation per tile with no such integer constraint: two Laplace
+     * tiles can (and empirically do) differ by a genuinely fractional
+     * number of cycles at their shared boundary (e.g. 1.26, not 1 or 2).
+     * Rounding that away leaves a real residual mismatch baked into the
+     * seam by construction -- confirmed via CUPHU_DEBUG tracing on a real
+     * scene (a raw 1.26-cycle offset rounded to 1, leaving a permanent
+     * ~1.6 rad single-pixel discontinuity at the stitch line) and via
+     * full-scene column-boundary profiling (sharp, single-pixel-wide
+     * jumps up to ~20 rad, with clean ~1.5 rad roughness on both sides --
+     * not a decaying boundary effect, a discrete registration mismatch).
+     * So tile_k stores a double: still integer-valued for MCF/MST
+     * (round() is idempotent on an already-integer value), fractional for
+     * Laplace, applied as a continuous phase_add either way. */
+    std::vector<double> tile_k(ntiles, 0.0);
 
     if (ntiles > 1 && (row_ovrlp > 0 || col_ovrlp > 0)) {
 
@@ -1128,21 +1646,60 @@ int cuphu_unwrap(
                     tag, d.size(), mean, std::sqrt(std::max(0.0,var)), lo, hi);
         };
 
+        /* Weighted median of (value, weight) pairs: sort by value, walk
+         * until cumulative weight passes half the total. Coherence as the
+         * weight means a pair of barely-above-threshold pixels can't move
+         * the result as much as a pair of solidly coherent ones -- the
+         * unweighted median treats every sample equally regardless of how
+         * much either pixel should actually be trusted. */
+        auto weighted_median = [](std::vector<std::pair<float,float>> &dw) -> double {
+            if (dw.empty()) return 0.0;
+            std::sort(dw.begin(), dw.end(),
+                      [](const std::pair<float,float> &a, const std::pair<float,float> &b) {
+                          return a.first < b.first;
+                      });
+            double total = 0.0;
+            for (auto &p : dw) total += p.second;
+            double half = total / 2.0, acc = 0.0;
+            for (auto &p : dw) {
+                acc += p.second;
+                if (acc >= half) return (double)p.first;
+            }
+            return (double)dw.back().first;
+        };
+
         /* Median diff in the horizontal overlap: left tile's rightmost
-         * col_ovrlp columns vs right tile's leftmost col_ovrlp columns. */
-        auto horiz_k = [&](int li, int ri) -> int {
+         * col_ovrlp columns vs right tile's leftmost col_ovrlp columns.
+         *
+         * Two confidence gates on top of the raw coherence>0.05 floor:
+         *  - conf_mask_t: excludes pixels invalid under the REAL (un-padded)
+         *    mask. Without this, a tile whose own PCG solve got corrupted
+         *    through a thin mask_pad_distance-padded connection (no real
+         *    signal there by construction) can leak that corruption into
+         *    this tile's *entire* whole-tile stitching offset -- confirmed
+         *    on real data: a handful of padded-through pixels skewed the
+         *    median enough to throw off a whole tile, which then cascaded
+         *    to every downstream tile via the BFS below.
+         *  - weighted_median: coherence as a continuous confidence weight
+         *    rather than a binary >0.05 cutoff, so marginal pixels near
+         *    that threshold can't sway the median as much as solidly
+         *    coherent ones. */
+        auto horiz_k = [&](int li, int ri) -> double {
             const TileWork& L = tiles[li];
             const TileWork& R = tiles[ri];
             if (col_ovrlp <= 0 || col_ovrlp > L.tncol || col_ovrlp > R.tncol)
-                return 0;
-            std::vector<float> d;
-            d.reserve((size_t)std::min(L.tnrow, R.tnrow) * col_ovrlp);
+                return 0.0;
+            std::vector<std::pair<float,float>> dw;
+            dw.reserve((size_t)std::min(L.tnrow, R.tnrow) * col_ovrlp);
+            std::vector<float> d;  /* raw diffs, for CUPHU_DEBUG dump_stats only */
             int nr = std::min(L.tnrow, R.tnrow);
             for (int r = 0; r < nr; ++r) {
                 for (int c = 0; c < col_ovrlp; ++c) {
                     size_t lp = (size_t)r * L.tncol + (L.tncol - col_ovrlp + c);
                     size_t rp = (size_t)r * R.tncol + c;
                     if (L.corr_t[lp] < 0.05f || R.corr_t[rp] < 0.05f) continue;
+                    if (!L.conf_mask_t.empty() && !L.conf_mask_t[lp]) continue;
+                    if (!R.conf_mask_t.empty() && !R.conf_mask_t[rp]) continue;
                     float dv = L.unw[lp] - R.unw[rp];
                     /* dv == 0 means the tiles already agree exactly here — the
                      * strongest possible signal that no offset is needed.
@@ -1150,48 +1707,53 @@ int cuphu_unwrap(
                      * which silently threw away the (typically overwhelming)
                      * majority of agreeing pixels and let a handful of
                      * outliers near residues/artifacts dominate the median. */
+                    dw.emplace_back(dv, std::min(L.corr_t[lp], R.corr_t[rp]));
                     d.push_back(dv);
                 }
             }
             dump_stats("horiz_k", d);
-            if (d.empty()) return 0;
-            auto mid = d.begin() + d.size() / 2;
-            std::nth_element(d.begin(), mid, d.end());
-            return (int)std::round((double)*mid / (2.0 * M_PI));
+            double cycles = weighted_median(dw) / (2.0 * M_PI);
+            return (init_meth == CUPHU_INIT_LAPLACE) ? cycles : std::round(cycles);
         };
 
         /* Median diff in the vertical overlap: top tile's bottom row_ovrlp
-         * rows vs bottom tile's top row_ovrlp rows. */
-        auto vert_k = [&](int ti, int bi) -> int {
+         * rows vs bottom tile's top row_ovrlp rows. See horiz_k above for
+         * the conf_mask_t / weighted_median rationale. */
+        auto vert_k = [&](int ti, int bi) -> double {
             const TileWork& T = tiles[ti];
             const TileWork& B = tiles[bi];
             if (row_ovrlp <= 0 || row_ovrlp > T.tnrow || row_ovrlp > B.tnrow)
-                return 0;
+                return 0.0;
+            std::vector<std::pair<float,float>> dw;
+            dw.reserve((size_t)std::min(T.tncol, B.tncol) * row_ovrlp);
             std::vector<float> d;
-            d.reserve((size_t)std::min(T.tncol, B.tncol) * row_ovrlp);
             int nc = std::min(T.tncol, B.tncol);
             for (int r = 0; r < row_ovrlp; ++r) {
                 for (int c = 0; c < nc; ++c) {
                     size_t tp = (size_t)(T.tnrow - row_ovrlp + r) * T.tncol + c;
                     size_t bp = (size_t)r * B.tncol + c;
                     if (T.corr_t[tp] < 0.05f || B.corr_t[bp] < 0.05f) continue;
+                    if (!T.conf_mask_t.empty() && !T.conf_mask_t[tp]) continue;
+                    if (!B.conf_mask_t.empty() && !B.conf_mask_t[bp]) continue;
                     float dv = T.unw[tp] - B.unw[bp];
                     /* see horiz_k: dv == 0 must not be excluded */
+                    dw.emplace_back(dv, std::min(T.corr_t[tp], B.corr_t[bp]));
                     d.push_back(dv);
                 }
             }
             dump_stats("vert_k", d);
-            if (d.empty()) return 0;
-            auto mid = d.begin() + d.size() / 2;
-            std::nth_element(d.begin(), mid, d.end());
-            return (int)std::round((double)*mid / (2.0 * M_PI));
+            double cycles = weighted_median(dw) / (2.0 * M_PI);
+            return (init_meth == CUPHU_INIT_LAPLACE) ? cycles : std::round(cycles);
         };
 
         /* BFS from tile (0,0) — propagate cumulative offsets.
          *
-         * horiz_k(L, R) = round((L.unw[overlap] - R.unw[overlap]) / 2π) = k
+         * horiz_k(L, R) = (L.unw[overlap] - R.unw[overlap]) / 2π = k
          * means L is k cycles AHEAD of R, so R needs +k*2π to match L.
-         * tile_k[R] = tile_k[L] + k so phase_add = tile_k[R] * 2π = +k*2π. */
+         * tile_k[R] = tile_k[L] + k so phase_add = tile_k[R] * 2π = +k*2π.
+         * k is rounded to the nearest integer for MCF/MST (exact there,
+         * per network-flow's integer circulation); left fractional for
+         * Laplace (no such constraint -- see tile_k's declaration above). */
         std::vector<bool> visited(ntiles, false);
         std::queue<int> bfs;
         bfs.push(0); visited[0] = true;
@@ -1202,10 +1764,10 @@ int cuphu_unwrap(
             if (bc + 1 < ntc) {
                 int nb = br * ntc + (bc + 1);
                 if (!visited[nb]) {
-                    int k = horiz_k(idx, nb);
+                    double k = horiz_k(idx, nb);
                     tile_k[nb] = tile_k[idx] + k;
                     if (std::getenv("CUPHU_DEBUG"))
-                        fprintf(stderr, "[cuphu] horiz_k(tile%d,tile%d)=%d  tile_k[%d]=%d\n",
+                        fprintf(stderr, "[cuphu] horiz_k(tile%d,tile%d)=%.4f  tile_k[%d]=%.4f\n",
                                 idx, nb, k, nb, tile_k[nb]);
                     visited[nb] = true; bfs.push(nb);
                 }
@@ -1214,10 +1776,10 @@ int cuphu_unwrap(
             if (br + 1 < ntr) {
                 int nb = (br + 1) * ntc + bc;
                 if (!visited[nb]) {
-                    int k = vert_k(idx, nb);
+                    double k = vert_k(idx, nb);
                     tile_k[nb] = tile_k[idx] + k;
                     if (std::getenv("CUPHU_DEBUG"))
-                        fprintf(stderr, "[cuphu] vert_k(tile%d,tile%d)=%d  tile_k[%d]=%d\n",
+                        fprintf(stderr, "[cuphu] vert_k(tile%d,tile%d)=%.4f  tile_k[%d]=%.4f\n",
                                 idx, nb, k, nb, tile_k[nb]);
                     visited[nb] = true; bfs.push(nb);
                 }
@@ -1254,6 +1816,21 @@ int cuphu_unwrap(
             }
             comp_offset += local_max;
         }
+    }
+
+    /* ── optional Laplace neighbor-feedback boundary refinement ──────────
+     * See apply_laplace_neighbor_feedback()'s header comment. Only
+     * meaningful for Laplace (MCF/MST's whole-tile offset is already
+     * exact); a no-op for single-tile scenes. */
+    if (tile->laplace_neighbor_feedback && ntiles > 1 && init_meth == CUPHU_INIT_LAPLACE) {
+        if (std::getenv("CUPHU_DEBUG"))
+            fprintf(stderr,
+                    "[cuphu] laplace_neighbor_feedback: refining %d internal "
+                    "tile boundaries (feather=%dpx)\n",
+                    (ntr - 1) + (ntc - 1), tile->laplace_neighbor_feedback_feather);
+        apply_laplace_neighbor_feedback(
+            result->unw, mask, nrow, ncol, ntr, ntc,
+            row_ovrlp, col_ovrlp, tile->laplace_neighbor_feedback_feather);
     }
 
     /* ── optional single-tile reoptimization ─────────────────────────────
@@ -1297,6 +1874,9 @@ int cuphu_unwrap(
         std::memcpy(result->unw, h_unw_reopt.data(), npix * sizeof(float));
         std::memcpy(result->conncomp, h_cc_reopt.data(), npix * sizeof(uint32_t));
     }
+
+    if (bridge && bridge->enabled)
+        apply_phase_bridging(result->unw, result->conncomp, nrow, ncol, bridge, mask, gpu_id);
 
     return 0;
 }

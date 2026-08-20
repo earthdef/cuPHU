@@ -105,7 +105,32 @@ typedef struct CuPhuTileParams {
                                   * snaphu-py's identically-named parameter).
                                   * Off by default -- see cuphu_unwrap()'s
                                   * multi-tile path.                          */
+    int laplace_neighbor_feedback; /* Laplace only: refine each internal tile
+                                  * boundary with a smoothly-varying (per-row
+                                  * for column boundaries, per-column for row
+                                  * boundaries) residual correction on top of
+                                  * the whole-tile bulk offset, feathered into
+                                  * the tile interior. Targets a real failure
+                                  * mode the whole-tile constant can't reach:
+                                  * independently-solved Laplace tiles can
+                                  * show a position-varying (not just
+                                  * tile-constant) mismatch along their shared
+                                  * boundary in marginal-coherence areas. Off
+                                  * by default. No effect for MCF/MST (their
+                                  * whole-tile offset is already exact).      */
+    int laplace_neighbor_feedback_feather; /* pixels over which the residual
+                                  * correction decays to zero moving away
+                                  * from the boundary; default 200.          */
 } CuPhuTileParams;
+
+/* ── phase-bridging parameters ───────────────────────────────────────────── */
+typedef struct CuPhuBridgeParams {
+    int enabled;
+    int radius;                 /* AOI half-size (px); NISAR default 500     */
+    int min_num_pixel;          /* NISAR default 14                          */
+    int erosion_size;           /* NISAR default 2                           */
+    int max_boundary_samples;   /* cuPHU-specific scaling safety valve       */
+} CuPhuBridgeParams;
 
 /* ── top-level result handle ─────────────────────────────────────────────── */
 typedef struct CuPhuResult {
@@ -122,6 +147,7 @@ typedef struct CuPhuResult {
  */
 void cuphu_default_params(CuPhuParams *p);
 void cuphu_default_tile_params(CuPhuTileParams *tp);
+void cuphu_default_bridge_params(CuPhuBridgeParams *bp);
 
 /**
  * Full GPU-accelerated unwrapping pipeline.
@@ -137,6 +163,25 @@ void cuphu_default_tile_params(CuPhuTileParams *tp);
  * @param init_meth Initialization algorithm
  * @param params    Algorithm parameters
  * @param tile      Tiling parameters
+ * @param bridge    Phase-bridging parameters (may be NULL, or enabled=0 --
+ *                  matches the mask/mag nullable convention); native port
+ *                  of isce3's bridge_unwrapped_phase()
+ * @param orig_mask Optional (may be NULL). The *real*, un-padded validity
+ *                  mask -- distinct from `mask`, which the caller may have
+ *                  grown (e.g. via mask_pad_distance) purely to give the
+ *                  PCG solve connectivity through otherwise-isolated
+ *                  features. Padded-through pixels carry no real
+ *                  interferometric signal (that's the whole point of
+ *                  padding), so tile-stitching's overlap-median must not
+ *                  treat them as trustworthy: confirmed on real data that
+ *                  a tile's own PCG solve can get corrupted in a thin
+ *                  padded-through connection, and without this, that
+ *                  corruption silently propagates into the *entire*
+ *                  tile's stitching offset (and, via BFS, cascades to
+ *                  every downstream tile) instead of being excluded as
+ *                  low-confidence. When NULL, falls back to `mask` --
+ *                  i.e. no behavior change for callers not using
+ *                  mask_pad_distance.
  * @param gpu_id    CUDA device ID (0 = first GPU)
  * @param result    Output – caller must free result->unw and result->conncomp
  * @return          0 on success, nonzero on failure
@@ -153,6 +198,8 @@ int cuphu_unwrap(
     CuPhuInitMethod     init_meth,
     const CuPhuParams  *params,
     const CuPhuTileParams *tile,
+    const CuPhuBridgeParams *bridge,
+    const unsigned char   *orig_mask,
     int                    gpu_id,
     CuPhuResult        *result
 );
@@ -210,6 +257,124 @@ void cuphu_conncomp_gpu(
                                           conncompthresh/minconncompfrac/maxncomps */
     int             gpu_id,
     uint32_t       *labels_out    /* nrow*ncol                    */
+);
+
+/**
+ * GPU 8-connectivity labeling of unw != 0, for phase-bridging.
+ * A different (simpler) connectivity notion than cuphu_conncomp_gpu: a
+ * pixel is valid iff unw != 0, and two valid pixels are connected under
+ * full 8-connectivity -- matches
+ * scipy.ndimage.label(unw != 0, structure=np.ones((3,3))) exactly.
+ * Output labels are compact 1..N (0 = unw==0, not part of any region);
+ * no small-region filtering is applied here (that's a separate CPU stage).
+ */
+void cuphu_bridge_label_gpu(
+    const float *unw,             /* nrow*ncol                    */
+    int          nrow,
+    int          ncol,
+    int          gpu_id,
+    uint32_t    *labels_out,      /* nrow*ncol                    */
+    int         *num_regions_out
+);
+
+/**
+ * GPU erosion-based small/thin-region pruning for phase-bridging, matching
+ * isce3's label_conn_comp (square SE) / label_boundary (circular SE)
+ * two-stage behavior: purely a survival test -- surviving regions keep
+ * their ORIGINAL (non-eroded) pixel shape; only a region with zero
+ * surviving pixels under erosion is dropped entirely. labels is modified
+ * in place (relabeled compactly 1..num_label_out); a no-op when
+ * erosion_size<=0 or num_label_in==0.
+ */
+void cuphu_bridge_erode_prune_gpu(
+    uint32_t *labels,             /* nrow*ncol, in/out             */
+    int       nrow,
+    int       ncol,
+    int       num_label_in,
+    int       erosion_size,
+    int       circular,           /* 0 = square SE, else circular  */
+    int       gpu_id,
+    int      *num_label_out
+);
+
+/**
+ * GPU 3x3 max/min-filter boundary extraction for phase-bridging, matching
+ * isce3's get_all_bridge() boundary predicate exactly: a labeled pixel is
+ * a boundary pixel iff its 3x3 neighborhood spans more than one label
+ * value (scipy default 'reflect' border handling).
+ */
+void cuphu_bridge_boundary_gpu(
+    const uint32_t *labels,       /* nrow*ncol                    */
+    int             nrow,
+    int             ncol,
+    int             gpu_id,
+    uint8_t        *boundary_out  /* nrow*ncol, 1 = boundary pixel */
+);
+
+/**
+ * GPU nearest-opposite-region-boundary search: for every unordered pair of
+ * regions, finds the minimum distance between their boundary points (and
+ * the achieving endpoint coordinates), via a uniform spatial grid + capped
+ * expanding-ring search per point instead of the O(N^2) region-pair
+ * KD-tree search this replaces (N = number of regions). Boundary points
+ * per region are subsampled to max_boundary_samples (uniform stride,
+ * capped at 4096) before the search, bounding total work to N x cap
+ * regardless of any single region's true perimeter. max_ring bounds the
+ * search radius in grid cells; a pair with no candidate within that radius
+ * gets distmat entry -1 (self-healing in practice -- MST only needs the
+ * global per-pair minimum over each region's many boundary points, not
+ * every pair to succeed).
+ *
+ * Output arrays must be sized (num_label+1)*(num_label+1) for distmat and
+ * (num_label+1)*(num_label+1)*4 for endpoints (y0,x0,y1,x1 per pair,
+ * row-major over [label_i][label_j]); label 0 (background) rows/cols are
+ * unused filler.
+ */
+void cuphu_bridge_nn_distmat_gpu(
+    const uint32_t *labels,        /* nrow*ncol                    */
+    const uint8_t  *boundary,      /* nrow*ncol, from cuphu_bridge_boundary_gpu */
+    int             nrow,
+    int             ncol,
+    int             num_label,
+    int             max_boundary_samples,
+    int             max_ring,
+    int             gpu_id,
+    float          *distmat_out,   /* (num_label+1)^2                */
+    int            *endpoint_out   /* (num_label+1)^2*4: y0,x0,y1,x1  */
+);
+
+/**
+ * Test-only entry point: runs the exact phase-bridging orchestration
+ * cuphu_unwrap() calls internally, on a caller-supplied unw+conncomp array
+ * directly (skipping the igram solve step). Lets integration tests exercise
+ * the full wired GPU pipeline against synthetic fixtures.
+ */
+void cuphu_bridge_apply_test(
+    float          *unw,        /* nrow*ncol, in/out */
+    uint32_t       *conncomp,   /* nrow*ncol, out     */
+    int             nrow,
+    int             ncol,
+    const CuPhuBridgeParams *bridge,
+    const unsigned char     *mask,   /* may be NULL */
+    int             gpu_id
+);
+
+/**
+ * Test-only entry point: runs the Laplace neighbor-feedback boundary
+ * refinement directly on a caller-supplied, already-tiled-and-stitched unw
+ * array (skipping the full tiled solve). Lets integration tests exercise
+ * the exact correction cuphu_unwrap() applies internally.
+ */
+void cuphu_laplace_neighbor_feedback_test(
+    float          *unw,        /* nrow*ncol, in/out */
+    const unsigned char *mask,  /* nrow*ncol, may be NULL */
+    int             nrow,
+    int             ncol,
+    int             ntr,
+    int             ntc,
+    int             row_ovrlp,
+    int             col_ovrlp,
+    int             feather_px
 );
 
 #ifdef __cplusplus

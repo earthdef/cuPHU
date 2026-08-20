@@ -39,6 +39,7 @@ extern "C" {
 /* forward declaration */
 extern "C" void cuphu_default_params(CuPhuParams *);
 extern "C" void cuphu_default_tile_params(CuPhuTileParams *);
+extern "C" void cuphu_default_bridge_params(CuPhuBridgeParams *);
 
 /* ── helpers ─────────────────────────────────────────────────────────────── */
 
@@ -103,6 +104,7 @@ py::tuple py_unwrap_arrays(
     std::string init        = "mcf",
     py::object  mask_obj    = py::none(),
     py::object  mag_obj     = py::none(),
+    py::object  orig_mask_obj = py::none(),
     double  costscale       = DEF_COSTSCALE,
     int     nshortcycle     = DEF_NSHORTCYCLE,
     int     kperpdpsi       = DEF_KPERPDPSI,
@@ -119,6 +121,13 @@ py::tuple py_unwrap_arrays(
     int     minregionsize   = DEF_MINREGIONSIZE,
     int     nproc           = 1,
     bool    single_tile_reoptimize = false,
+    bool    laplace_neighbor_feedback = false,
+    int     laplace_neighbor_feedback_feather = 200,
+    bool    bridge                  = false,
+    int     bridge_radius           = 500,
+    int     bridge_min_num_pixel    = 14,
+    int     bridge_erosion_size     = 2,
+    int     bridge_max_boundary_samples = 4096,
     int     gpu_id          = 0
 ) {
     if (igram.ndim() != 2)
@@ -162,6 +171,16 @@ py::tuple py_unwrap_arrays(
         mask_ptr = mask_arr.data();
     }
 
+    /* Optional orig_mask -- see cuphu_unwrap()'s docstring. Falls back to
+     * mask_ptr (== nullptr if orig_mask is None too) when not given. */
+    const unsigned char *orig_mask_ptr = nullptr;
+    py::array_t<uint8_t, py::array::c_style> orig_mask_arr;
+    if (!orig_mask_obj.is_none()) {
+        orig_mask_arr = orig_mask_obj.cast<py::array_t<uint8_t, py::array::c_style>>();
+        check_array_2d(orig_mask_arr, "orig_mask");
+        orig_mask_ptr = orig_mask_arr.data();
+    }
+
     CuPhuParams params = make_params(
         nlooks, costscale, nshortcycle, kperpdpsi, kpardpsi,
         defomax, min_conncomp_frac, max_ncomps, conncompthresh);
@@ -176,6 +195,16 @@ py::tuple py_unwrap_arrays(
     tile.minregionsize  = minregionsize;
     tile.nproc          = nproc;
     tile.single_tile_reoptimize = single_tile_reoptimize ? 1 : 0;
+    tile.laplace_neighbor_feedback = laplace_neighbor_feedback ? 1 : 0;
+    tile.laplace_neighbor_feedback_feather = laplace_neighbor_feedback_feather;
+
+    CuPhuBridgeParams bp;
+    cuphu_default_bridge_params(&bp);
+    bp.enabled              = bridge ? 1 : 0;
+    bp.radius               = bridge_radius;
+    bp.min_num_pixel        = bridge_min_num_pixel;
+    bp.erosion_size         = bridge_erosion_size;
+    bp.max_boundary_samples = bridge_max_boundary_samples;
 
     CuPhuResult result = {};
     int rc = cuphu_unwrap(
@@ -184,7 +213,7 @@ py::tuple py_unwrap_arrays(
         nrow, ncol,
         parse_cost_mode(cost),
         parse_init_method(init),
-        &params, &tile, gpu_id, &result);
+        &params, &tile, &bp, orig_mask_ptr, gpu_id, &result);
 
     if (rc != 0)
         throw std::runtime_error("cuphu_unwrap failed with code " + std::to_string(rc));
@@ -264,6 +293,91 @@ py::array py_build_costs(
         (uint8_t *)costs_ptr, free_costs);
 }
 
+/* ── bridge test hook (internal) ────────────────────────────────────────── */
+
+/* Test-only binding: runs the exact phase-bridging orchestration
+ * cuphu_unwrap() calls internally on a caller-supplied unw array directly
+ * (skipping the igram solve), so pytest can exercise the full wired GPU
+ * pipeline against synthetic ground-truth fixtures without needing a real
+ * interferogram to induce a genuine MCF ambiguity. */
+py::tuple py_bridge_apply_test(
+    py::array_t<float, py::array::c_style> unw,
+    py::object mask_obj = py::none(),
+    int    bridge_radius        = 500,
+    int    bridge_min_num_pixel = 14,
+    int    bridge_erosion_size  = 2,
+    int    bridge_max_boundary_samples = 4096,
+    int    gpu_id = 0
+) {
+    check_array_2d(unw, "unw");
+    int nrow = (int)unw.shape(0);
+    int ncol = (int)unw.shape(1);
+
+    const unsigned char *mask_ptr = nullptr;
+    py::array_t<uint8_t, py::array::c_style> mask_arr;
+    if (!mask_obj.is_none()) {
+        mask_arr = mask_obj.cast<py::array_t<uint8_t, py::array::c_style>>();
+        check_array_2d(mask_arr, "mask");
+        mask_ptr = mask_arr.data();
+    }
+
+    std::vector<float> unw_buf(unw.data(), unw.data() + (size_t)nrow * ncol);
+    std::vector<uint32_t> cc_buf((size_t)nrow * ncol, 0u);
+
+    CuPhuBridgeParams bp;
+    cuphu_default_bridge_params(&bp);
+    bp.enabled              = 1;
+    bp.radius               = bridge_radius;
+    bp.min_num_pixel        = bridge_min_num_pixel;
+    bp.erosion_size         = bridge_erosion_size;
+    bp.max_boundary_samples = bridge_max_boundary_samples;
+
+    cuphu_bridge_apply_test(unw_buf.data(), cc_buf.data(), nrow, ncol, &bp, mask_ptr, gpu_id);
+
+    auto unw_out = py::array_t<float>({(py::ssize_t)nrow, (py::ssize_t)ncol});
+    std::memcpy(unw_out.mutable_data(), unw_buf.data(), unw_buf.size() * sizeof(float));
+    auto cc_out = py::array_t<uint32_t>({(py::ssize_t)nrow, (py::ssize_t)ncol});
+    std::memcpy(cc_out.mutable_data(), cc_buf.data(), cc_buf.size() * sizeof(uint32_t));
+
+    return py::make_tuple(unw_out, cc_out);
+}
+
+/* Test-only binding: runs apply_laplace_neighbor_feedback() directly on a
+ * caller-supplied, already-stitched unw array. Lets pytest exercise the
+ * exact boundary-refinement correction cuphu_unwrap() applies internally,
+ * against real (or synthetic) already-tiled results without a full solve. */
+py::array_t<float> py_laplace_neighbor_feedback_test(
+    py::array_t<float, py::array::c_style> unw,
+    py::object mask_obj,
+    int ntilerow,
+    int ntilecol,
+    int row_ovrlp,
+    int col_ovrlp,
+    int feather_px
+) {
+    check_array_2d(unw, "unw");
+    int nrow = (int)unw.shape(0);
+    int ncol = (int)unw.shape(1);
+
+    const unsigned char *mask_ptr = nullptr;
+    py::array_t<uint8_t, py::array::c_style> mask_arr;
+    if (!mask_obj.is_none()) {
+        mask_arr = mask_obj.cast<py::array_t<uint8_t, py::array::c_style>>();
+        check_array_2d(mask_arr, "mask");
+        mask_ptr = mask_arr.data();
+    }
+
+    std::vector<float> unw_buf(unw.data(), unw.data() + (size_t)nrow * ncol);
+
+    cuphu_laplace_neighbor_feedback_test(
+        unw_buf.data(), mask_ptr, nrow, ncol,
+        ntilerow, ntilecol, row_ovrlp, col_ovrlp, feather_px);
+
+    auto unw_out = py::array_t<float>({(py::ssize_t)nrow, (py::ssize_t)ncol});
+    std::memcpy(unw_out.mutable_data(), unw_buf.data(), unw_buf.size() * sizeof(float));
+    return unw_out;
+}
+
 /* ── device query helpers ─────────────────────────────────────────────────── */
 
 static int py_gpu_count() {
@@ -300,6 +414,7 @@ PYBIND11_MODULE(_cuphu_ext, m) {
         "init"_a         = "mcf",
         "mask"_a         = py::none(),
         "mag"_a          = py::none(),
+        "orig_mask"_a    = py::none(),
         "costscale"_a    = DEF_COSTSCALE,
         "nshortcycle"_a  = DEF_NSHORTCYCLE,
         "kperpdpsi"_a    = DEF_KPERPDPSI,
@@ -316,6 +431,13 @@ PYBIND11_MODULE(_cuphu_ext, m) {
         "minregionsize"_a     = DEF_MINREGIONSIZE,
         "nproc"_a        = 1,
         "single_tile_reoptimize"_a = false,
+        "laplace_neighbor_feedback"_a = false,
+        "laplace_neighbor_feedback_feather"_a = 200,
+        "bridge"_a                  = false,
+        "bridge_radius"_a           = 500,
+        "bridge_min_num_pixel"_a    = 14,
+        "bridge_erosion_size"_a     = 2,
+        "bridge_max_boundary_samples"_a = 4096,
         "gpu_id"_a       = 0,
         R"(
 Unwrap an interferogram using GPU-accelerated SNAPHU.
@@ -338,6 +460,14 @@ mask : ndarray, uint8, 2-D, optional
     Valid-pixel mask (0 = invalid).
 mag : ndarray, float32, 2-D, optional
     Interferogram magnitude. Derived from igram if None.
+orig_mask : ndarray, uint8, 2-D, optional
+    The *real*, un-padded validity mask, distinct from `mask` (which the
+    caller may have grown, e.g. to give the PCG solve connectivity through
+    isolated features). Tile-stitching's overlap-median only trusts pixels
+    valid under orig_mask, so a tile's PCG solve getting corrupted through
+    a thin padded-through connection can't silently propagate into that
+    tile's whole-tile stitching offset. Falls back to `mask` when None --
+    no behavior change for callers not padding the mask.
 single_tile_reoptimize : bool, optional
     After tiled unwrapping and stitching, rerun a full CPU network-flow
     solve over the whole assembled scene as one tile to clean up tile-
@@ -345,6 +475,38 @@ single_tile_reoptimize : bool, optional
     No effect when ntilerow*ntilecol == 1. Off by default: this is a
     full-scene CPU solve with the same cost profile as snaphu-py's
     single_tile_reoptimize, which can dominate wall time on large scenes.
+laplace_neighbor_feedback : bool, optional
+    Laplace only (init='laplace'). Refines each internal tile boundary with
+    a smoothly-varying (per-row for column boundaries, per-column for row
+    boundaries) residual correction on top of the whole-tile bulk offset,
+    feathered into the tile interior over laplace_neighbor_feedback_feather
+    px. Targets a failure mode the whole-tile constant offset can't reach:
+    independently-solved Laplace tiles can show a position-varying (not
+    just tile-constant) mismatch along their shared boundary in
+    marginal-coherence areas. Off by default. No effect for MCF/MST (their
+    whole-tile offset is already exact) or when ntilerow*ntilecol == 1.
+laplace_neighbor_feedback_feather : int, optional
+    Pixels over which the boundary correction above decays to zero moving
+    away from the boundary. Only used when laplace_neighbor_feedback=True.
+bridge : bool, optional
+    Reconcile whole-2*pi-cycle offsets between disconnected regions of
+    unwrapped phase (e.g. regions split apart by a mask) -- a native
+    GPU/C++ port of isce3's bridge_unwrapped_phase(). Off by default. v1
+    has no ramp/deramp support (isce3's ramp_type); NISAR's own production
+    default is already ramp_type=None, so this covers the mode actually
+    used in production. Parameter names/defaults mirror NISAR's production
+    bridge_* runconfig keys.
+bridge_radius : int, optional
+    AOI half-size (px) for the per-bridge median phase comparison.
+bridge_min_num_pixel : int, optional
+    Regions smaller than this are dropped before bridging.
+bridge_erosion_size : int, optional
+    Structuring-element size (px) for erosion-based thin/small-region
+    pruning (two-stage: square SE, then circular SE).
+bridge_max_boundary_samples : int, optional
+    Cap on boundary points sampled per region for the nearest-neighbor
+    region-pair search, bounding cost regardless of any single region's
+    true perimeter.
 gpu_id : int, optional
     CUDA device index (default 0).
 
@@ -373,6 +535,25 @@ conncomp : ndarray, uint32, 2-D
     m.def("gpu_name", &py_gpu_name,
         "device_id"_a = 0,
         "Return the name of the CUDA device.");
+
+    m.def("_bridge_apply_test", &py_bridge_apply_test,
+        "unw"_a, "mask"_a = py::none(),
+        "bridge_radius"_a = 500,
+        "bridge_min_num_pixel"_a = 14,
+        "bridge_erosion_size"_a = 2,
+        "bridge_max_boundary_samples"_a = 4096,
+        "gpu_id"_a = 0,
+        "Test-only: run phase bridging directly on a caller-supplied unw "
+        "array (skips the igram solve). Not part of the public API.");
+
+    m.def("_laplace_neighbor_feedback_test", &py_laplace_neighbor_feedback_test,
+        "unw"_a, "mask"_a = py::none(),
+        "ntilerow"_a, "ntilecol"_a,
+        "row_ovrlp"_a, "col_ovrlp"_a,
+        "feather_px"_a = 200,
+        "Test-only: run the Laplace neighbor-feedback boundary refinement "
+        "directly on a caller-supplied, already-stitched unw array. Not "
+        "part of the public API.");
 
     m.def("gpu_info", &py_gpu_info,
         "device_id"_a = 0,

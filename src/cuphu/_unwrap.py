@@ -107,6 +107,7 @@ def unwrap(
     single_tile_reoptimize: bool = False,
     laplace_neighbor_feedback: bool = False,
     laplace_neighbor_feedback_feather: int = 200,
+    fix_cycle_spikes: bool = False,
     bridge: bool = False,
     bridge_radius: int = 500,
     bridge_min_num_pixel: int = 14,
@@ -141,6 +142,7 @@ def unwrap(
     single_tile_reoptimize: bool = False,
     laplace_neighbor_feedback: bool = False,
     laplace_neighbor_feedback_feather: int = 200,
+    fix_cycle_spikes: bool = False,
     bridge: bool = False,
     bridge_radius: int = 500,
     bridge_min_num_pixel: int = 14,
@@ -176,6 +178,7 @@ def unwrap(  # type: ignore[no-untyped-def]
     single_tile_reoptimize=False,
     laplace_neighbor_feedback=False,
     laplace_neighbor_feedback_feather=200,
+    fix_cycle_spikes=False,
     bridge=False,
     bridge_radius=500,
     bridge_min_num_pixel=14,
@@ -342,6 +345,16 @@ def unwrap(  # type: ignore[no-untyped-def]
         Pixels over which the boundary correction above decays to zero
         moving away from the boundary. Only used when
         *laplace_neighbor_feedback* is True.
+    fix_cycle_spikes : bool, optional
+        Detect and correct isolated single row/column whole-2\ :math:`\pi`
+        -cycle spikes: a row (or column) whose median offset from both
+        immediate neighbors is the same nonzero integer multiple of
+        2\ :math:`\pi`, while those neighbors agree with each other -- the
+        signature of a degenerate network-flow (``init='mcf'``/``'mst'``,
+        or ``single_tile_reoptimize``) solution with a spurious,
+        self-cancelling flow loop through one row/column. Confirmed on a
+        real 240M-pixel scene: 17 isolated rows out of 18240, no local
+        coherence anomaly at any of them. Off by default.
     bridge : bool, optional
         Reconcile whole-2\ :math:`\pi`-cycle offsets between disconnected
         regions of unwrapped phase (e.g. regions split apart by *mask*) --
@@ -520,6 +533,7 @@ def unwrap(  # type: ignore[no-untyped-def]
         single_tile_reoptimize=bool(single_tile_reoptimize),
         laplace_neighbor_feedback=bool(internal_feedback),
         laplace_neighbor_feedback_feather=int(laplace_neighbor_feedback_feather),
+        fix_cycle_spikes=bool(fix_cycle_spikes),
         bridge=bool(bridge),
         bridge_radius=int(bridge_radius),
         bridge_min_num_pixel=int(bridge_min_num_pixel),

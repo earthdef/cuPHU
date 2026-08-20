@@ -31,6 +31,7 @@
 #include <functional>
 #include <atomic>
 #include <queue>
+#include <limits>
 
 /* ── optional profiling ──────────────────────────────────────────────────────── */
 #ifdef CUPHU_PROFILE
@@ -1235,6 +1236,82 @@ void cuphu_bridge_apply_test(
     apply_phase_bridging(unw, conncomp, nrow, ncol, bp, mask, gpu_id);
 }
 
+/* ── isolated row/column whole-cycle spike correction ─────────────────────
+ *
+ * Network-flow solvers (MCF/MST, and single_tile_reoptimize's CPU
+ * TreeSolve) can land on a degenerate solution where one row or column
+ * carries a spurious, self-cancelling closed flow loop: every pixel in
+ * that single row/column comes out shifted from the true value by the
+ * same nonzero integer multiple of 2*pi, while both immediate neighbor
+ * rows/columns agree with each other and the broader trend. Confirmed on
+ * a real 240M-pixel single_tile_reoptimize run: 17 such isolated rows out
+ * of 18240, no local coherence anomaly at any of them.
+ *
+ * Detection is per-row (then per-column): compare each row's median
+ * against its two immediate neighbors' medians. A spike is a row whose
+ * offset from both neighbors rounds to the same nonzero cycle count,
+ * within tolerance -- neighbors that already disagree with each other
+ * (a real, gradual scene trend) never round to a common count, so a
+ * genuine smooth ramp is left untouched.
+ */
+static void fix_cycle_spikes_1d(
+    float *unw, const unsigned char *mask, int nrow, int ncol, bool by_row
+) {
+    const double TWO_PI = 2.0 * M_PI;
+    const double TOL = 0.5; /* rad, around a clean cycle multiple */
+    int n_lines = by_row ? nrow : ncol;
+    int line_len = by_row ? ncol : nrow;
+
+    std::vector<double> med(n_lines, std::numeric_limits<double>::quiet_NaN());
+    std::vector<uint8_t> have(n_lines, 0);
+    std::vector<float> buf;
+    buf.reserve(line_len);
+    for (int i = 0; i < n_lines; ++i) {
+        buf.clear();
+        for (int j = 0; j < line_len; ++j) {
+            int r = by_row ? i : j;
+            int c = by_row ? j : i;
+            size_t gi = (size_t)r * ncol + c;
+            if (!mask || mask[gi] != 0) buf.push_back(unw[gi]);
+        }
+        if (buf.size() > 20) {
+            std::nth_element(buf.begin(), buf.begin() + buf.size() / 2, buf.end());
+            med[i] = buf[buf.size() / 2];
+            have[i] = 1;
+        }
+    }
+
+    for (int i = 1; i < n_lines - 1; ++i) {
+        if (!have[i] || !have[i - 1] || !have[i + 1]) continue;
+        double up = med[i] - med[i - 1];
+        double down = med[i] - med[i + 1];
+        double n_up = std::round(up / TWO_PI);
+        double n_down = std::round(down / TWO_PI);
+        if (n_up == 0.0 || n_up != n_down) continue;
+        if (std::fabs(up - n_up * TWO_PI) > TOL) continue;
+        if (std::fabs(down - n_down * TWO_PI) > TOL) continue;
+
+        float corr = (float)(n_up * TWO_PI);
+        for (int j = 0; j < line_len; ++j) {
+            int r = by_row ? i : j;
+            int c = by_row ? j : i;
+            size_t gi = (size_t)r * ncol + c;
+            if (!mask || mask[gi] != 0) unw[gi] -= corr;
+        }
+        med[i] -= corr;
+        if (std::getenv("CUPHU_DEBUG"))
+            fprintf(stderr, "[cuphu] fix_cycle_spikes: %s %d shifted by %.0f*2pi\n",
+                    by_row ? "row" : "col", i, -n_up);
+    }
+}
+
+static void fix_cycle_spikes(
+    float *unw, const unsigned char *mask, int nrow, int ncol
+) {
+    fix_cycle_spikes_1d(unw, mask, nrow, ncol, /*by_row=*/true);
+    fix_cycle_spikes_1d(unw, mask, nrow, ncol, /*by_row=*/false);
+}
+
 /* ── Laplace neighbor-feedback boundary refinement ────────────────────────
  *
  * The whole-tile bulk-offset stitching (tile_k via horiz_k/vert_k above)
@@ -1457,6 +1534,13 @@ void cuphu_laplace_neighbor_feedback_test(
 ) {
     apply_laplace_neighbor_feedback(unw, mask, nrow, ncol, ntr, ntc,
                                     row_ovrlp, col_ovrlp, feather_px);
+}
+
+extern "C"
+void cuphu_fix_cycle_spikes_test(
+    float *unw, const unsigned char *mask, int nrow, int ncol
+) {
+    fix_cycle_spikes(unw, mask, nrow, ncol);
 }
 
 extern "C"
@@ -1873,6 +1957,13 @@ int cuphu_unwrap(
 
         std::memcpy(result->unw, h_unw_reopt.data(), npix * sizeof(float));
         std::memcpy(result->conncomp, h_cc_reopt.data(), npix * sizeof(uint32_t));
+    }
+
+    if (tile->fix_cycle_spikes) {
+        if (std::getenv("CUPHU_DEBUG"))
+            fprintf(stderr, "[cuphu] fix_cycle_spikes: scanning %dx%d for "
+                    "isolated row/column whole-cycle spikes\n", nrow, ncol);
+        fix_cycle_spikes(result->unw, mask, nrow, ncol);
     }
 
     if (bridge && bridge->enabled)

@@ -121,6 +121,20 @@ typedef struct CuPhuTileParams {
     int laplace_neighbor_feedback_feather; /* pixels over which the residual
                                   * correction decays to zero moving away
                                   * from the boundary; default 200.          */
+    int fix_cycle_spikes;    /* Detect and correct isolated single
+                                  * row/column whole-2*pi-cycle spikes: a
+                                  * row (or column) whose median offset from
+                                  * BOTH immediate neighbors is the same
+                                  * nonzero integer multiple of 2*pi, while
+                                  * those neighbors agree with each other --
+                                  * the signature of a degenerate
+                                  * network-flow (MCF/MST/reoptimize)
+                                  * solution containing a spurious,
+                                  * self-cancelling flow loop through one
+                                  * row/column. Confirmed on a real
+                                  * 240M-pixel single_tile_reoptimize run
+                                  * (17 isolated rows out of 18240). Off by
+                                  * default.                                 */
 } CuPhuTileParams;
 
 /* ── phase-bridging parameters ───────────────────────────────────────────── */
@@ -375,6 +389,19 @@ void cuphu_laplace_neighbor_feedback_test(
     int             row_ovrlp,
     int             col_ovrlp,
     int             feather_px
+);
+
+/**
+ * Test-only entry point: runs the isolated row/column whole-cycle spike
+ * correction directly on a caller-supplied unw array (skipping the full
+ * solve). Lets integration tests exercise the exact correction
+ * cuphu_unwrap() applies internally.
+ */
+void cuphu_fix_cycle_spikes_test(
+    float          *unw,        /* nrow*ncol, in/out */
+    const unsigned char *mask,  /* nrow*ncol, may be NULL */
+    int             nrow,
+    int             ncol
 );
 
 #ifdef __cplusplus

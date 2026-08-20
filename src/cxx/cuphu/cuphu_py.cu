@@ -123,6 +123,7 @@ py::tuple py_unwrap_arrays(
     bool    single_tile_reoptimize = false,
     bool    laplace_neighbor_feedback = false,
     int     laplace_neighbor_feedback_feather = 200,
+    bool    fix_cycle_spikes = false,
     bool    bridge                  = false,
     int     bridge_radius           = 500,
     int     bridge_min_num_pixel    = 14,
@@ -197,6 +198,7 @@ py::tuple py_unwrap_arrays(
     tile.single_tile_reoptimize = single_tile_reoptimize ? 1 : 0;
     tile.laplace_neighbor_feedback = laplace_neighbor_feedback ? 1 : 0;
     tile.laplace_neighbor_feedback_feather = laplace_neighbor_feedback_feather;
+    tile.fix_cycle_spikes = fix_cycle_spikes ? 1 : 0;
 
     CuPhuBridgeParams bp;
     cuphu_default_bridge_params(&bp);
@@ -378,6 +380,34 @@ py::array_t<float> py_laplace_neighbor_feedback_test(
     return unw_out;
 }
 
+/* Test-only binding: runs cuphu_fix_cycle_spikes_test() directly on a
+ * caller-supplied unw array. Lets pytest exercise the exact isolated
+ * row/column spike correction cuphu_unwrap() applies internally. */
+py::array_t<float> py_fix_cycle_spikes_test(
+    py::array_t<float, py::array::c_style> unw,
+    py::object mask_obj
+) {
+    check_array_2d(unw, "unw");
+    int nrow = (int)unw.shape(0);
+    int ncol = (int)unw.shape(1);
+
+    const unsigned char *mask_ptr = nullptr;
+    py::array_t<uint8_t, py::array::c_style> mask_arr;
+    if (!mask_obj.is_none()) {
+        mask_arr = mask_obj.cast<py::array_t<uint8_t, py::array::c_style>>();
+        check_array_2d(mask_arr, "mask");
+        mask_ptr = mask_arr.data();
+    }
+
+    std::vector<float> unw_buf(unw.data(), unw.data() + (size_t)nrow * ncol);
+
+    cuphu_fix_cycle_spikes_test(unw_buf.data(), mask_ptr, nrow, ncol);
+
+    auto unw_out = py::array_t<float>({(py::ssize_t)nrow, (py::ssize_t)ncol});
+    std::memcpy(unw_out.mutable_data(), unw_buf.data(), unw_buf.size() * sizeof(float));
+    return unw_out;
+}
+
 /* ── device query helpers ─────────────────────────────────────────────────── */
 
 static int py_gpu_count() {
@@ -433,6 +463,7 @@ PYBIND11_MODULE(_cuphu_ext, m) {
         "single_tile_reoptimize"_a = false,
         "laplace_neighbor_feedback"_a = false,
         "laplace_neighbor_feedback_feather"_a = 200,
+        "fix_cycle_spikes"_a = false,
         "bridge"_a                  = false,
         "bridge_radius"_a           = 500,
         "bridge_min_num_pixel"_a    = 14,
@@ -488,6 +519,13 @@ laplace_neighbor_feedback : bool, optional
 laplace_neighbor_feedback_feather : int, optional
     Pixels over which the boundary correction above decays to zero moving
     away from the boundary. Only used when laplace_neighbor_feedback=True.
+fix_cycle_spikes : bool, optional
+    Detect and correct isolated single row/column whole-2*pi-cycle spikes:
+    a row (or column) whose median offset from both immediate neighbors is
+    the same nonzero integer multiple of 2*pi, while those neighbors agree
+    with each other -- the signature of a degenerate network-flow
+    (MCF/MST/reoptimize) solution with a spurious, self-cancelling flow
+    loop through one row/column. Off by default.
 bridge : bool, optional
     Reconcile whole-2*pi-cycle offsets between disconnected regions of
     unwrapped phase (e.g. regions split apart by a mask) -- a native
@@ -554,6 +592,12 @@ conncomp : ndarray, uint32, 2-D
         "Test-only: run the Laplace neighbor-feedback boundary refinement "
         "directly on a caller-supplied, already-stitched unw array. Not "
         "part of the public API.");
+
+    m.def("_fix_cycle_spikes_test", &py_fix_cycle_spikes_test,
+        "unw"_a, "mask"_a = py::none(),
+        "Test-only: run the isolated row/column whole-cycle spike "
+        "correction directly on a caller-supplied unw array. Not part of "
+        "the public API.");
 
     m.def("gpu_info", &py_gpu_info,
         "device_id"_a = 0,

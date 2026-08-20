@@ -112,6 +112,7 @@ def unwrap(
     bridge_min_num_pixel: int = 14,
     bridge_erosion_size: int = 2,
     bridge_max_boundary_samples: int = 4096,
+    reference_pixel: tuple[int, int] | None = (0, 0),
     gpu_id: int = 0,
     unw: OutputDataset,
     conncomp: OutputDataset,
@@ -145,6 +146,7 @@ def unwrap(
     bridge_min_num_pixel: int = 14,
     bridge_erosion_size: int = 2,
     bridge_max_boundary_samples: int = 4096,
+    reference_pixel: tuple[int, int] | None = (0, 0),
     gpu_id: int = 0,
 ) -> tuple[np.ndarray, np.ndarray]: ...
 
@@ -179,6 +181,7 @@ def unwrap(  # type: ignore[no-untyped-def]
     bridge_min_num_pixel=14,
     bridge_erosion_size=2,
     bridge_max_boundary_samples=4096,
+    reference_pixel=(0, 0),
     gpu_id=0,
     unw=None,
     conncomp=None,
@@ -369,6 +372,16 @@ def unwrap(  # type: ignore[no-untyped-def]
         Cap on boundary points sampled per region for the nearest-neighbor
         region-pair search, bounding cost regardless of any single
         region's true perimeter. Only used when *bridge* is True.
+    reference_pixel : (int, int) or None, optional
+        (row, col) to shift the whole output by an integer number of 2*pi
+        cycles so that pixel matches its own raw wrapped phase exactly.
+        Unwrapped phase is only ever defined up to an arbitrary additive
+        constant; SNAPHU's MCF/MST always anchors to (0, 0) (see
+        ``phi[0][0] = psi[0][0]`` in ``ext/snaphu/src/snaphu_util.c``),
+        while ``'laplace'``'s reference emerges from a global relaxation
+        and generally lands elsewhere. Defaults to ``(0, 0)``, matching
+        MCF/MST's own convention (a no-op for those methods, since they
+        already satisfy it by construction); pass None to disable.
     gpu_id : int, optional
         CUDA device index. Defaults to 0.
     unw : array_like or None, optional
@@ -525,6 +538,20 @@ def unwrap(  # type: ignore[no-untyped-def]
         # restore the ORIGINAL mask's validity for reporting -- padded
         # pixels solved-through for convergence are not reported as valid.
         cc_out = np.where(mask_u8 != 0, cc_out, 0).astype(cc_out.dtype)
+
+    if reference_pixel is not None:
+        # match SNAPHU's own MCF/MST reference convention (see docstring)
+        # by shifting the whole output to an integer number of 2*pi
+        # cycles from the reference pixel's raw wrapped phase. Uses the
+        # same atan2-shifted-to-[0,2*pi) convention as the C extension's
+        # own internal h_phase, so this matches exactly what MCF/MST see.
+        rp, rc = int(reference_pixel[0]), int(reference_pixel[1])
+        ref_phase = float(np.angle(igram_c64[rp, rc]))
+        if ref_phase < 0.0:
+            ref_phase += 2.0 * np.pi
+        n = round((float(unw_out[rp, rc]) - ref_phase) / (2.0 * np.pi))
+        if n != 0:
+            unw_out = unw_out - np.float32(n * 2.0 * np.pi)
 
     # write to pre-allocated outputs if provided
     # Use [...] indexing so h5py datasets are written to disk (np.asarray()

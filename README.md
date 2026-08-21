@@ -17,9 +17,9 @@ entirely on GPU.
 
 | Method | `init=` | Solver | Results | When to use |
 |---|---|---|---|---|
-| **MCF** | `'mcf'` | GPU cost + CPU network-flow | Match SNAPHU-MCF |  **Recommended default.** Fastest option once tiled. |
+| **MCF** | `'mcf'` | GPU cost + CPU network-flow | Exact match to SNAPHU-MCF | **Recommended default.** Best when you need an exact match to SNAPHU (e.g. validation baselines). Auto-tiles with `nproc` for speed at scale. |
 | **MST** | `'mst'` | GPU cost + CPU spanning tree | To be tested | Not recommended until validated. |
-| **Laplace PCG** | `'laplace'` | Runs entirely on GPU | Match MCF to within noise on most scenes |  Recommended for simplicity — no CPU thread/tile planning needed. Fastest option for one-tile. |
+| **Laplace PCG** | `'laplace'` | Runs entirely on GPU | Match MCF to within noise on most scenes | Fastest option, especially on large scenes (auto-tiles, no CPU threads needed). Prefer when speed matters most; pair with `single_tile_reoptimize`/`fix_cycle_spikes` to clean up occasional PCG-specific artifacts on very large scenes. |
 
 
 ## Requirements
@@ -154,23 +154,13 @@ runconfig:
                 cuphu:
                     # Unwrapping algorithm: 'mcf' (follow snaphu-mcf) or 'laplace'
                     init: mcf
-                    # (row, col) tile count for large scenes
+                    # (row, col) tile count for large scenes.
+                    # Leave unset to auto-compute (toward target_tile_size px/edge)
                     ntiles: [4, 4]
                     tile_overlap: [64, 64]
                     # CPU threads for parallel tile network-flow solves (mcf only)
                     nproc: 16
                     gpu_id: 0
-
-                # cuphu has no CPU-only code path: if worker.gpu_enabled is False,
-                # the workflow automatically falls back to SNAPHU, using this
-                # snaphu: block (independently of the cuphu: block above).
-                snaphu:
-                    # Same semantics as cuphu's init, but the key is
-                    # initialization_method and 'laplace' isn't an option.
-                    initialization_method: mcf
-                    ntiles: [4, 4]
-                    tile_overlap: [64, 64]
-                    nproc: 16
 ```
 
 The `cuphu:` block mirrors `cuphu.unwrap()`'s keyword arguments directly
@@ -225,20 +215,34 @@ cuphu.unwrap(
     cost="smooth",            # 'smooth' | 'defo'  (statistical cost mode)
     init="mcf",               # 'laplace' | 'mcf' | 'mst'
     mask=None,                # uint8/bool mask — 0 means invalid pixel
+    mask_pad_distance=0,      # grow valid mask by N px before solving (see notes)
     mag=None,                 # float32 amplitude (derived from igram if None)
     min_conncomp_frac=0.01,   # minimum connected component as fraction of total
     phase_grad_window=(7, 7), # boxcar averaging window for wrapped gradients
-    ntiles=(1, 1),            # (row, col) tile count for large scenes
-    tile_overlap=0,           # pixel overlap between adjacent tiles
+    ntiles=None,              # (row, col) tile count; auto-computed if None
+    tile_overlap=None,        # pixel overlap between adjacent tiles
+    target_tile_size=1024,    # target tile edge (px), used to auto-compute ntiles
     nproc=1,                  # CPU threads for parallel tile network-flow solves
     tile_cost_thresh=500,
     min_region_size=100,
+    single_tile_reoptimize=False,  # CPU re-solve of the whole scene after tiling
+    fix_cycle_spikes=False,   # detect/correct isolated row/column 2π spikes
+    bridge=False,             # reconcile disconnected regions' whole-cycle offsets
+    bridge_radius=500,
+    bridge_min_num_pixel=14,
+    bridge_erosion_size=2,
+    bridge_max_boundary_samples=4096,
+    bridge_ramp_type=None,    # ramp to remove before bridging, add back after
+    bridge_ramp_max_num_sample=1000000,
+    reference_pixel=(0, 0),   # shift output to match this pixel's raw wrapped phase
     gpu_id=0,                 # CUDA device index
     unw=None,                 # pre-allocated float32 output array
     conncomp=None,            # pre-allocated uint32 output array
 )
 # returns: (unw: float32 ndarray, conncomp: uint32 ndarray)
 ```
+
+See each parameter's docstring (`help(cuphu.unwrap)`) for full details.
 
 ### GPU utilities
 
@@ -249,6 +253,11 @@ cuphu.gpu_info(0)     # dict: name, total_memory, sm_count, compute_capability
 ```
 
 ### Tiling (large scenes)
+
+`ntiles` is optional — leave it unset and cuPHU auto-computes a tiling
+(toward `target_tile_size` px per tile edge): always for `init='laplace'`,
+and for `init='mcf'`/`'mst'` when `nproc > 1` (so the parallel tile solve
+has tiles to distribute). Pass it explicitly to override:
 
 ```python
 # 9 CPU threads solving 3×3 = 9 tiles in parallel
@@ -261,7 +270,39 @@ unw, conncomp = cuphu.unwrap(
 )
 ```
 
-Tiling splits the cost computation and solve across tiles; GPU streams overlap with CPU solver work. Each tile gets its own connected-component labels; boundary stitching re-registers the tiles' absolute phase levels afterward.
+Tiling splits the cost computation and solve across tiles; GPU streams overlap with CPU solver work. Each tile gets its own connected-component labels; boundary stitching re-registers the tiles' absolute phase levels afterward. Optionally follow up with `single_tile_reoptimize=True` or `bridge=True` for further cleanup.
+
+### Water masking and bridging
+
+A mask (0 = invalid) that excludes a water body, or any other feature,
+can split the scene's valid area into separate disconnected regions. Each
+region gets solved with its own independent absolute-phase offset, so two
+land areas on either side of a lake can end up on different whole-cycle
+levels even though they're both physically part of the same continuous
+deformation field. `bridge=True` reconciles this after the solve, so the
+whole scene comes out on one consistent level:
+
+```python
+unw, conncomp = cuphu.unwrap(
+    igram, corr, nlooks,
+    init="mcf",
+    mask=water_mask,   # uint8/bool, 0 = invalid (e.g. water)
+    bridge=True,
+)
+```
+
+Bridging compares a median phase value on either side of each gap (within
+`bridge_radius` px) to pick the whole-cycle offset between regions, so it
+needs enough real signal near each gap to be reliable — tune
+`bridge_min_num_pixel`/`bridge_erosion_size` down for small or thin
+regions. If the scene has a steep phase gradient (e.g. a strong ramp)
+across a narrow gap, the raw median comparison can pick the wrong
+whole-cycle jump; `bridge_ramp_type` (e.g. `'linear'`, `'quadratic'`)
+fits and removes a ramp before comparing, then adds it back after.
+
+Combine with `mask_pad_distance` if the mask also has narrow/isolated
+valid slivers near a boundary that need a bit of padding to solve
+reliably.
 
 ## Copyright
 

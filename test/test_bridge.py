@@ -107,6 +107,44 @@ def test_bridge_respects_mask_not_raw_unw_zero() -> None:
     np.testing.assert_array_equal(unw_out[:, 28:32], unw[:, 28:32])
 
 
+@gpu_only
+def test_bridge_ramp_fixes_wrong_jump_from_steep_gradient() -> None:
+    """A steep ramp across a narrow gap can bias the raw AOI-median diff
+    past the pi rounding threshold, picking the wrong whole-cycle jump.
+    Deramping first (fit over the reference region, remove, bridge, add
+    back) should recover the true (zero) offset exactly."""
+    nrow, ncol = 200, 10
+    r_idx, _ = np.mgrid[0:nrow, 0:ncol]
+    ramp = 5.0 + 0.2 * r_idx.astype(np.float64)  # steep: 0.2*20=4.0 rad > pi
+    unw = ramp.astype(np.float32)
+
+    mask = np.ones((nrow, ncol), dtype=np.uint8)
+    mask[90:110, :] = 0   # 20-row gap
+
+    unw_no_ramp, _ = _cuphu_ext._bridge_apply_test(
+        unw.copy(), mask=mask, bridge_min_num_pixel=1, bridge_erosion_size=0,
+        bridge_radius=15, bridge_ramp_type=None)
+    unw_ramp, _ = _cuphu_ext._bridge_apply_test(
+        unw.copy(), mask=mask, bridge_min_num_pixel=1, bridge_erosion_size=0,
+        bridge_radius=15, bridge_ramp_type="linear_azimuth")
+
+    valid = mask == 1
+    assert (unw_no_ramp[valid] - ramp[valid]).std() > 1.0   # wrong jump
+    np.testing.assert_allclose(unw_ramp[valid], ramp[valid], atol=1e-3)
+
+
+@gpu_only
+def test_bridge_ramp_none_matches_default() -> None:
+    nrow, ncol = 40, 60
+    unw_true = 0.03 * np.arange(ncol)[None, :] * np.ones((nrow, 1)) + 1.0
+    igram = np.exp(1j * unw_true).astype(np.complex64)
+    corr = np.full((nrow, ncol), 0.85, dtype=np.float32)
+
+    unw_a, _ = cuphu.unwrap(igram, corr, nlooks=10.0, bridge=True)
+    unw_b, _ = cuphu.unwrap(igram, corr, nlooks=10.0, bridge=True, bridge_ramp_type=None)
+    np.testing.assert_array_equal(unw_a, unw_b)
+
+
 # ── API-level smoke tests, via the public cuphu.unwrap() entry point ──────────
 
 @gpu_only

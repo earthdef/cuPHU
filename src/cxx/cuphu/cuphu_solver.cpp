@@ -244,6 +244,8 @@ void cuphu_default_bridge_params(CuPhuBridgeParams *bp) {
     bp->min_num_pixel        = 14;
     bp->erosion_size         = 2;
     bp->max_boundary_samples = 4096;
+    bp->ramp_type            = CUPHU_RAMP_NONE;
+    bp->ramp_max_num_sample  = 1000000;
 }
 
 /* ── translate CuPhuParams → SNAPHU's paramT ─────────────────────────── */
@@ -1043,6 +1045,121 @@ static int bridge_find_reference_region(
     return best;
 }
 
+/* ramp basis terms at (row, col); matches isce3's bridge_phase.py deramp() */
+static int ramp_basis(CuPhuRampType rt, double row, double col, double g[6]) {
+    switch (rt) {
+    case CUPHU_RAMP_LINEAR:
+        g[0]=row; g[1]=col; g[2]=1; return 3;
+    case CUPHU_RAMP_QUADRATIC:
+        g[0]=row*row; g[1]=col*col; g[2]=row*col; g[3]=row; g[4]=col; g[5]=1; return 6;
+    case CUPHU_RAMP_LINEAR_RANGE:
+        g[0]=col; g[1]=1; return 2;
+    case CUPHU_RAMP_LINEAR_AZIMUTH:
+        g[0]=row; g[1]=1; return 2;
+    case CUPHU_RAMP_QUADRATIC_RANGE:
+        g[0]=col*col; g[1]=col; g[2]=1; return 3;
+    case CUPHU_RAMP_QUADRATIC_AZIMUTH:
+        g[0]=row*row; g[1]=row; g[2]=1; return 3;
+    default:
+        return 0;
+    }
+}
+
+/* Gaussian elimination with partial pivoting, n<=6 */
+static bool solve_small_system(double A[6][6], double b[6], int n, double x[6]) {
+    for (int p = 0; p < n; ++p) {
+        int piv = p;
+        for (int r = p + 1; r < n; ++r)
+            if (std::fabs(A[r][p]) > std::fabs(A[piv][p])) piv = r;
+        if (std::fabs(A[piv][p]) < 1e-12) return false;
+        if (piv != p) { std::swap(A[piv], A[p]); std::swap(b[piv], b[p]); }
+        for (int r = p + 1; r < n; ++r) {
+            double f = A[r][p] / A[p][p];
+            for (int c = p; c < n; ++c) A[r][c] -= f * A[p][c];
+            b[r] -= f * b[p];
+        }
+    }
+    for (int r = n - 1; r >= 0; --r) {
+        double s = b[r];
+        for (int c = r + 1; c < n; ++c) s -= A[r][c] * x[c];
+        x[r] = s / A[r][r];
+    }
+    return true;
+}
+
+struct RampFit { CuPhuRampType type = CUPHU_RAMP_NONE; int nterm = 0;
+                  double coef[6] = {0}; bool valid = false; };
+
+/* fit over label_ref pixels (unw != 0), grid-stride subsampled to
+ * max_num_sample -- matches deramp()'s own subsample exactly */
+static RampFit fit_ramp(
+    const float *unw, const std::vector<uint32_t> &labels, int nrow, int ncol,
+    uint32_t label_ref, CuPhuRampType ramp_type, int max_num_sample
+) {
+    RampFit fit;
+    if (ramp_type == CUPHU_RAMP_NONE) return fit;
+    double dummy[6];
+    fit.type = ramp_type;
+    fit.nterm = ramp_basis(ramp_type, 0, 0, dummy);
+
+    size_t count = 0;
+    for (int row = 0; row < nrow; ++row)
+        for (int col = 0; col < ncol; ++col) {
+            size_t i = (size_t)row * ncol + col;
+            if (labels[i] == label_ref && unw[i] != 0.0f) ++count;
+        }
+    if (count == 0) return fit;
+
+    int step = 1;
+    if (max_num_sample > 0 && (long)count > max_num_sample)
+        step = (int)std::ceil(std::sqrt((double)count / max_num_sample));
+    int half = step / 2;
+
+    double GtG[6][6] = {{0}};
+    double Gty[6] = {0};
+    for (int row = 0; row < nrow; ++row) {
+        if (step > 1 && row % step != half) continue;
+        for (int col = 0; col < ncol; ++col) {
+            if (step > 1 && col % step != half) continue;
+            size_t i = (size_t)row * ncol + col;
+            if (labels[i] != label_ref || unw[i] == 0.0f) continue;
+            double g[6];
+            ramp_basis(ramp_type, (double)row, (double)col, g);
+            for (int a = 0; a < fit.nterm; ++a) {
+                Gty[a] += g[a] * (double)unw[i];
+                for (int b = 0; b < fit.nterm; ++b) GtG[a][b] += g[a] * g[b];
+            }
+        }
+    }
+    fit.valid = solve_small_system(GtG, Gty, fit.nterm, fit.coef);
+    if (std::getenv("CUPHU_DEBUG"))
+        fprintf(stderr, "[cuphu] ramp fit: type=%d nterm=%d valid=%d count=%zu "
+                "coef=[%.4f %.4f %.4f %.4f %.4f %.4f]\n",
+                (int)ramp_type, fit.nterm, fit.valid, count,
+                fit.coef[0], fit.coef[1], fit.coef[2], fit.coef[3], fit.coef[4], fit.coef[5]);
+    return fit;
+}
+
+/* add (sign=+1) or subtract (sign=-1) the fitted ramp over the whole
+ * array, gated by `nonzero` (the ORIGINAL data's zero-ness, computed once
+ * -- matching deramp()'s ignore_zero_value). Must NOT re-check unw[i]==0
+ * after subtracting: a perfect fit can drive a pixel to exactly 0.0, and
+ * re-checking would then skip adding the ramp back there. */
+static void apply_ramp(float *unw, int nrow, int ncol, const RampFit &fit,
+                       double sign, const std::vector<uint8_t> &nonzero) {
+    if (!fit.valid) return;
+    for (int row = 0; row < nrow; ++row)
+        for (int col = 0; col < ncol; ++col) {
+            size_t i = (size_t)row * ncol + col;
+            if (!nonzero[i]) continue;
+            double g[6];
+            ramp_basis(fit.type, (double)row, (double)col, g);
+            double ramp = 0.0;
+            for (int a = 0; a < fit.nterm; ++a) ramp += fit.coef[a] * g[a];
+            unw[i] += (float)(sign * ramp);
+        }
+}
+
 struct BridgeEdge { int label0, label1, y0, x0, y1, x1; };
 
 /* Prim's MST over the (small, N<=~1000) region distance matrix, then BFS
@@ -1182,6 +1299,15 @@ static void apply_phase_bridging(
 
     int label_ref = bridge_find_reference_region(labels, num_label);
 
+    RampFit ramp_fit = fit_ramp(unw, labels, nrow, ncol, (uint32_t)label_ref,
+                                bp->ramp_type, bp->ramp_max_num_sample);
+    std::vector<uint8_t> ramp_nonzero;
+    if (ramp_fit.valid) {
+        ramp_nonzero.resize(npix);
+        for (size_t i = 0; i < npix; ++i) ramp_nonzero[i] = unw[i] != 0.0f;
+        apply_ramp(unw, nrow, ncol, ramp_fit, -1.0, ramp_nonzero);
+    }
+
     std::vector<uint8_t> boundary(npix);
     cuphu_bridge_boundary_gpu(labels.data(), nrow, ncol, gpu_id, boundary.data());
 
@@ -1221,6 +1347,8 @@ static void apply_phase_bridging(
         if (l == 0) continue;
         unw[idx] += (float)corr[l];
     }
+
+    if (ramp_fit.valid) apply_ramp(unw, nrow, ncol, ramp_fit, +1.0, ramp_nonzero);
 }
 
 /* test-only entry point: exercises the exact same wired pipeline

@@ -28,11 +28,12 @@ __all__ = ["unwrap"]
 _DEFAULT_LAPLACE_TILE_OVERLAP = 64
 
 
-def _auto_laplace_ntiles(nrow, ncol, target_tile_size, row_ovrlp, col_ovrlp):
+def _auto_ntiles_by_target_size(nrow, ncol, target_tile_size, row_ovrlp, col_ovrlp):
     """Choose (ntilerow, ntilecol) so every tile has close to the *same*
     edge length in both directions, near target_tile_size (including
-    overlap) -- see the *ntiles*/*target_tile_size* docstrings in unwrap()
-    for why this matters for ``init='laplace'``.
+    overlap). Shared by both init methods' auto-tiling -- see the
+    *ntiles*/*target_tile_size* docstrings in unwrap() for why each one
+    tiles at all (laplace: PCG convergence; mcf/mst: parallel throughput).
 
     Derives one reference edge length from whichever scene dimension is
     larger (rounded to the nearest whole tile count for that axis), then
@@ -45,7 +46,9 @@ def _auto_laplace_ntiles(nrow, ncol, target_tile_size, row_ovrlp, col_ovrlp):
     biases toward an extra, disproportionately small "remainder" tile on
     whichever axis doesn't divide evenly (e.g. a 1847px axis at an 874px
     reference edge length ceils to 3 tiles of ~616px rather than rounding
-    to 2 tiles of ~924px) -- rounding to nearest avoids that.
+    to 2 tiles of ~924px) -- rounding to nearest avoids that. A scene
+    already smaller than target_tile_size naturally stays single-tile
+    (n_max floors at 1), so no separate small-scene guard is needed.
     """
     ovrlp = max(row_ovrlp, col_ovrlp)
     step = max(1, target_tile_size - ovrlp)
@@ -113,6 +116,8 @@ def unwrap(
     bridge_min_num_pixel: int = 14,
     bridge_erosion_size: int = 2,
     bridge_max_boundary_samples: int = 4096,
+    bridge_ramp_type: str | None = None,
+    bridge_ramp_max_num_sample: int = 1000000,
     reference_pixel: tuple[int, int] | None = (0, 0),
     gpu_id: int = 0,
     unw: OutputDataset,
@@ -148,6 +153,8 @@ def unwrap(
     bridge_min_num_pixel: int = 14,
     bridge_erosion_size: int = 2,
     bridge_max_boundary_samples: int = 4096,
+    bridge_ramp_type: str | None = None,
+    bridge_ramp_max_num_sample: int = 1000000,
     reference_pixel: tuple[int, int] | None = (0, 0),
     gpu_id: int = 0,
 ) -> tuple[np.ndarray, np.ndarray]: ...
@@ -184,6 +191,8 @@ def unwrap(  # type: ignore[no-untyped-def]
     bridge_min_num_pixel=14,
     bridge_erosion_size=2,
     bridge_max_boundary_samples=4096,
+    bridge_ramp_type=None,
+    bridge_ramp_max_num_sample=1000000,
     reference_pixel=(0, 0),
     gpu_id=0,
     unw=None,
@@ -257,16 +266,21 @@ def unwrap(  # type: ignore[no-untyped-def]
         in the (perpendicular, parallel) directions.
     ntiles : (int, int) or None, optional
         Number of tiles in (row, column) directions. If None (default):
-        for ``init='mcf'``/``'mst'``, defaults to a single tile ``(1, 1)``,
-        matching historical behavior. For ``init='laplace'``, defaults to
-        an automatically computed tiling that keeps each tile's edge length
-        near *target_tile_size* (see below) -- a single huge tile leaves
-        the Jacobi-preconditioned CG solve unable to converge on large
-        scenes (its iteration count scales with tile edge length), which
-        can silently produce whole-cycle errors over large, otherwise
-        well-correlated regions. Pass an explicit value to override either
+        for ``init='laplace'``, defaults to an automatically computed
+        tiling that keeps each tile's edge length near *target_tile_size*
+        (see below) -- a single huge tile leaves the Jacobi-preconditioned
+        CG solve unable to converge on large scenes (its iteration count
+        scales with tile edge length), which can silently produce
+        whole-cycle errors over large, otherwise well-correlated regions.
+        For ``init='mcf'``/``'mst'``, defaults to a single tile ``(1, 1)``
+        when *nproc* is 1; when *nproc* > 1, auto-tiles the same way as
+        laplace (toward *target_tile_size*, not toward a tile count) --
+        TreeSolve has no laplace-style correctness reason to tile, so this
+        only happens to give the parallel tile solve something to
+        distribute across threads. Pass an explicit value to override any
         default, including ``(1, 1)`` to force single-tile Laplace (fine,
-        even faster, for scenes already smaller than *target_tile_size*).
+        even faster, for scenes already smaller than *target_tile_size*) or
+        single-tile MCF/MST regardless of *nproc*.
     tile_overlap : int or (int, int) or None, optional
         Pixel overlap between adjacent tiles, used to register tiles
         against each other (median offset over the shared region). If
@@ -275,10 +289,11 @@ def unwrap(  # type: ignore[no-untyped-def]
         above to register tiles correctly -- explicitly pass 0 only if
         also passing ``ntiles=(1, 1)``).
     target_tile_size : int, optional
-        Target tile edge length in pixels, including overlap, used only to
-        auto-compute *ntiles* when ``init='laplace'`` and *ntiles* is None.
+        Target tile edge length in pixels, including overlap, used to
+        auto-compute *ntiles* when *ntiles* is None, for ``init='laplace'``
+        always and for ``init='mcf'``/``'mst'`` when *nproc* > 1.
         Empirically, edge lengths of roughly 1000-2000px converge reliably
-        within the solver's internal iteration cap without either
+        within the laplace solver's internal iteration cap without either
         stalling (too large: >~4000px measurably degrades convergence,
         ~8800px can leave whole regions a full cycle wrong) or losing
         registration accuracy (too small: <~700px starts raising
@@ -286,9 +301,16 @@ def unwrap(  # type: ignore[no-untyped-def]
         dominated by one bad local feature and from longer inter-tile
         stitching chains). 1024 is a reasonable default across that range;
         tune down for scenes with large decorrelated features, or up for
-        speed if a scene is known to be uniformly well-correlated.
+        speed if a scene is known to be uniformly well-correlated. For
+        mcf/mst this same default is a reasonable, but not similarly
+        measured, throughput heuristic -- TreeSolve has no convergence
+        dependence on tile size.
     nproc : int, optional
-        Maximum number of CPU threads for parallel tile network-flow solves.
+        Maximum number of CPU threads for parallel tile network-flow solves
+        (``init='mcf'``/``'mst'`` only). If < 1, uses all available cores.
+        Also gates whether mcf/mst's own *ntiles* auto-tiling above runs at
+        all when *ntiles* is None -- set explicitly to 1 to keep
+        single-tile mcf/mst regardless of core count.
     tile_cost_thresh : int, optional
         Cost threshold for determining reliable tile regions.
     min_region_size : int, optional
@@ -298,7 +320,10 @@ def unwrap(  # type: ignore[no-untyped-def]
         solve (SNAPHU's exact TreeSolve, not the GPU-accelerated path) over
         the entire assembled scene as a single tile, seeded from the
         stitched result, to clean up tile-boundary artifacts. Has no effect
-        when the effective tiling is ``(1, 1)``.
+        when the effective tiling is ``(1, 1)`` -- including mcf/mst's own
+        ``nproc``-driven auto-tiling above, worth turning on together with
+        ``nproc`` > 1 if you want tiled-for-parallelism mcf/mst without its
+        tile-boundary stitching caveats.
 
         cuPHU's own tile stitching (median 2π offset per tile pair,
         propagated via a spanning tree over tile adjacency) is
@@ -385,6 +410,13 @@ def unwrap(  # type: ignore[no-untyped-def]
         Cap on boundary points sampled per region for the nearest-neighbor
         region-pair search, bounding cost regardless of any single
         region's true perimeter. Only used when *bridge* is True.
+    bridge_ramp_type : str or None, optional
+        Ramp to fit over the reference region and remove before bridging,
+        add back after: one of 'linear', 'quadratic', 'linear_range',
+        'linear_azimuth', 'quadratic_range', 'quadratic_azimuth', or None
+        (no ramp, default). Matches isce3's bridge_phase.py deramp().
+    bridge_ramp_max_num_sample : int, optional
+        Uniform grid-stride subsample cap for the ramp fit. Default 1e6.
     reference_pixel : (int, int) or None, optional
         (row, col) to shift the whole output by an integer number of 2*pi
         cycles so that pixel matches its own raw wrapped phase exactly.
@@ -442,6 +474,11 @@ def unwrap(  # type: ignore[no-untyped-def]
     if nlooks < 1.0:
         raise ValueError(f"nlooks must be >= 1, got {nlooks}")
 
+    # normalize nproc first -- mcf/mst auto-tiling below needs the
+    # resolved value to decide whether tiling for parallelism is worth it.
+    if nproc < 1:
+        nproc = os.cpu_count() or 1
+
     # normalize tile_overlap -- default depends on init: laplace tiling
     # needs overlap to register tiles (see ntiles below), mcf/mst historically
     # defaulted to none.
@@ -454,19 +491,23 @@ def unwrap(  # type: ignore[no-untyped-def]
     # normalize ntiles -- default depends on init: a single huge tile leaves
     # laplace's PCG solve unable to converge on large scenes (iteration count
     # scales with tile edge length), so auto-tile toward target_tile_size
-    # unless the caller passed an explicit ntiles. mcf/mst default unchanged.
+    # unless the caller passed an explicit ntiles. mcf/mst has no such
+    # correctness reason to tile, but a parallel tile solve (nproc > 1) has
+    # nothing to distribute across without >1 tile, so auto-tile the same
+    # way (toward target_tile_size, not toward nproc directly -- nproc just
+    # gates whether it's worth tiling at all) when nproc > 1; nproc == 1
+    # (the default) stays single-tile.
     if ntiles is None:
         if init == "laplace":
-            ntilerow, ntilecol = _auto_laplace_ntiles(
+            ntilerow, ntilecol = _auto_ntiles_by_target_size(
+                nrow, ncol, target_tile_size, row_ovrlp, col_ovrlp)
+        elif nproc > 1:
+            ntilerow, ntilecol = _auto_ntiles_by_target_size(
                 nrow, ncol, target_tile_size, row_ovrlp, col_ovrlp)
         else:
             ntilerow, ntilecol = 1, 1
     else:
         ntilerow, ntilecol = int(ntiles[0]), int(ntiles[1])
-
-    # normalize nproc
-    if nproc < 1:
-        nproc = os.cpu_count() or 1
 
     # ensure C-contiguous complex64 and float32
     igram_c64 = np.ascontiguousarray(igram, dtype=np.complex64)
@@ -539,6 +580,8 @@ def unwrap(  # type: ignore[no-untyped-def]
         bridge_min_num_pixel=int(bridge_min_num_pixel),
         bridge_erosion_size=int(bridge_erosion_size),
         bridge_max_boundary_samples=int(bridge_max_boundary_samples),
+        bridge_ramp_type=bridge_ramp_type,
+        bridge_ramp_max_num_sample=int(bridge_ramp_max_num_sample),
         gpu_id=gpu_id,
     )
 

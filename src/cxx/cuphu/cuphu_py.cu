@@ -57,6 +57,20 @@ static CuPhuInitMethod parse_init_method(const std::string &s) {
     throw std::invalid_argument("init must be 'mst', 'mcf', or 'laplace'");
 }
 
+static CuPhuRampType parse_ramp_type(const py::object &obj) {
+    if (obj.is_none()) return CUPHU_RAMP_NONE;
+    std::string s = obj.cast<std::string>();
+    if (s == "linear")             return CUPHU_RAMP_LINEAR;
+    if (s == "quadratic")          return CUPHU_RAMP_QUADRATIC;
+    if (s == "linear_range")       return CUPHU_RAMP_LINEAR_RANGE;
+    if (s == "linear_azimuth")     return CUPHU_RAMP_LINEAR_AZIMUTH;
+    if (s == "quadratic_range")    return CUPHU_RAMP_QUADRATIC_RANGE;
+    if (s == "quadratic_azimuth")  return CUPHU_RAMP_QUADRATIC_AZIMUTH;
+    throw std::invalid_argument("bridge_ramp_type must be one of: linear, "
+        "quadratic, linear_range, linear_azimuth, quadratic_range, "
+        "quadratic_azimuth, or None");
+}
+
 /** Validate that arr is a 2-D C-contiguous array of the given dtype. */
 template<typename Scalar>
 static void check_array_2d(const py::array_t<Scalar, py::array::c_style> &arr,
@@ -129,6 +143,8 @@ py::tuple py_unwrap_arrays(
     int     bridge_min_num_pixel    = 14,
     int     bridge_erosion_size     = 2,
     int     bridge_max_boundary_samples = 4096,
+    py::object bridge_ramp_type_obj = py::none(),
+    int     bridge_ramp_max_num_sample = 1000000,
     int     gpu_id          = 0
 ) {
     if (igram.ndim() != 2)
@@ -207,6 +223,8 @@ py::tuple py_unwrap_arrays(
     bp.min_num_pixel        = bridge_min_num_pixel;
     bp.erosion_size         = bridge_erosion_size;
     bp.max_boundary_samples = bridge_max_boundary_samples;
+    bp.ramp_type            = parse_ramp_type(bridge_ramp_type_obj);
+    bp.ramp_max_num_sample  = bridge_ramp_max_num_sample;
 
     CuPhuResult result = {};
     int rc = cuphu_unwrap(
@@ -309,6 +327,8 @@ py::tuple py_bridge_apply_test(
     int    bridge_min_num_pixel = 14,
     int    bridge_erosion_size  = 2,
     int    bridge_max_boundary_samples = 4096,
+    py::object bridge_ramp_type_obj = py::none(),
+    int    bridge_ramp_max_num_sample = 1000000,
     int    gpu_id = 0
 ) {
     check_array_2d(unw, "unw");
@@ -333,6 +353,8 @@ py::tuple py_bridge_apply_test(
     bp.min_num_pixel        = bridge_min_num_pixel;
     bp.erosion_size         = bridge_erosion_size;
     bp.max_boundary_samples = bridge_max_boundary_samples;
+    bp.ramp_type            = parse_ramp_type(bridge_ramp_type_obj);
+    bp.ramp_max_num_sample  = bridge_ramp_max_num_sample;
 
     cuphu_bridge_apply_test(unw_buf.data(), cc_buf.data(), nrow, ncol, &bp, mask_ptr, gpu_id);
 
@@ -469,6 +491,8 @@ PYBIND11_MODULE(_cuphu_ext, m) {
         "bridge_min_num_pixel"_a    = 14,
         "bridge_erosion_size"_a     = 2,
         "bridge_max_boundary_samples"_a = 4096,
+        "bridge_ramp_type"_a = py::none(),
+        "bridge_ramp_max_num_sample"_a = 1000000,
         "gpu_id"_a       = 0,
         R"(
 Unwrap an interferogram using GPU-accelerated SNAPHU.
@@ -545,6 +569,13 @@ bridge_max_boundary_samples : int, optional
     Cap on boundary points sampled per region for the nearest-neighbor
     region-pair search, bounding cost regardless of any single region's
     true perimeter.
+bridge_ramp_type : str or None, optional
+    Ramp to fit over the reference region and remove before bridging, add
+    back after: one of 'linear', 'quadratic', 'linear_range',
+    'linear_azimuth', 'quadratic_range', 'quadratic_azimuth', or None (no
+    ramp, default). Matches isce3's bridge_phase.py deramp().
+bridge_ramp_max_num_sample : int, optional
+    Uniform grid-stride subsample cap for the ramp fit. Default 1e6.
 gpu_id : int, optional
     CUDA device index (default 0).
 
@@ -580,6 +611,8 @@ conncomp : ndarray, uint32, 2-D
         "bridge_min_num_pixel"_a = 14,
         "bridge_erosion_size"_a = 2,
         "bridge_max_boundary_samples"_a = 4096,
+        "bridge_ramp_type"_a = py::none(),
+        "bridge_ramp_max_num_sample"_a = 1000000,
         "gpu_id"_a = 0,
         "Test-only: run phase bridging directly on a caller-supplied unw "
         "array (skips the igram solve). Not part of the public API.");

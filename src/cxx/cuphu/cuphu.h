@@ -137,6 +137,18 @@ typedef struct CuPhuTileParams {
                                   * default.                                 */
 } CuPhuTileParams;
 
+/* Ramp removed from the reference region before bridging, added back
+ * after. Matches isce3's bridge_phase.py deramp(). NONE = no ramp. */
+typedef enum {
+    CUPHU_RAMP_NONE = 0,
+    CUPHU_RAMP_LINEAR,
+    CUPHU_RAMP_QUADRATIC,
+    CUPHU_RAMP_LINEAR_RANGE,
+    CUPHU_RAMP_LINEAR_AZIMUTH,
+    CUPHU_RAMP_QUADRATIC_RANGE,
+    CUPHU_RAMP_QUADRATIC_AZIMUTH
+} CuPhuRampType;
+
 /* ── phase-bridging parameters ───────────────────────────────────────────── */
 typedef struct CuPhuBridgeParams {
     int enabled;
@@ -144,6 +156,9 @@ typedef struct CuPhuBridgeParams {
     int min_num_pixel;          /* NISAR default 14                          */
     int erosion_size;           /* NISAR default 2                           */
     int max_boundary_samples;   /* cuPHU-specific scaling safety valve       */
+    CuPhuRampType ramp_type;    /* CUPHU_RAMP_NONE = no ramp (default)       */
+    int ramp_max_num_sample;    /* uniform-subsample cap for the ramp fit;
+                                  * NISAR default 1e6                        */
 } CuPhuBridgeParams;
 
 /* ── top-level result handle ─────────────────────────────────────────────── */

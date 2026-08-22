@@ -345,7 +345,8 @@ def unwrap(  # type: ignore[no-untyped-def]
         mechanism that made ``snaphu-py``'s reopt pass run for hours on a
         large NISAR scene when left at its default). Enable it for final/
         delivery-quality runs, or when tile-boundary artifacts are visibly
-        present; leave it off for speed-sensitive runs.
+        present; leave it off for speed-sensitive runs. Supersedes
+        *laplace_neighbor_feedback*, which is a no-op when this is True.
     laplace_neighbor_feedback : bool, optional
         ``init='laplace'`` only. Refines each internal tile boundary with a
         smoothly-varying (per-row for column boundaries, per-column for row
@@ -364,8 +365,9 @@ def unwrap(  # type: ignore[no-untyped-def]
         it reduced the typical row-level mismatch by 5-20%, with the
         remaining residual dominated by genuine per-pixel noise that no
         offset-based correction can remove. Off by default. No effect for
-        ``init='mcf'``/``'mst'`` (their whole-tile offset is already exact)
-        or when the effective tiling is ``(1, 1)``.
+        ``init='mcf'``/``'mst'`` (their whole-tile offset is already exact),
+        when the effective tiling is ``(1, 1)``, or when
+        *single_tile_reoptimize* is True (which supersedes it).
     laplace_neighbor_feedback_feather : int, optional
         Pixels over which the boundary correction above decays to zero
         moving away from the boundary. Only used when
@@ -546,10 +548,14 @@ def unwrap(  # type: ignore[no-untyped-def]
     # mask, so the correction only ever trusts genuinely real boundary
     # pixels -- exactly where mask_pad_distance's own gap-filling logic
     # (bounded fade, not unbounded extrapolation) is designed to help.
+    # single_tile_reoptimize supersedes laplace_neighbor_feedback (redundant
+    # once reoptimize re-solves the whole scene, validated slightly worse).
+    effective_neighbor_feedback = laplace_neighbor_feedback and not single_tile_reoptimize
+
     feedback_needs_orig_mask = (
-        mask_u8 is not None and mask_pad_distance > 0 and laplace_neighbor_feedback
+        mask_u8 is not None and mask_pad_distance > 0 and effective_neighbor_feedback
     )
-    internal_feedback = laplace_neighbor_feedback and not feedback_needs_orig_mask
+    internal_feedback = effective_neighbor_feedback and not feedback_needs_orig_mask
 
     kperpdpsi, kpardpsi = int(phase_grad_window[0]), int(phase_grad_window[1])
 

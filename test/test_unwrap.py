@@ -254,6 +254,24 @@ def test_reopt_single_tile_is_noop(
 
 
 @gpu_only
+def test_reopt_supersedes_neighbor_feedback(
+    reopt_igram: np.ndarray, reopt_corr: np.ndarray
+) -> None:
+    """laplace_neighbor_feedback is a no-op when single_tile_reoptimize is
+    True."""
+    unw_fb, cc_fb = cuphu.unwrap(
+        reopt_igram, reopt_corr, nlooks=4.0, init="laplace",
+        ntiles=(2, 2), tile_overlap=4,
+        single_tile_reoptimize=True, laplace_neighbor_feedback=True)
+    unw_nofb, cc_nofb = cuphu.unwrap(
+        reopt_igram, reopt_corr, nlooks=4.0, init="laplace",
+        ntiles=(2, 2), tile_overlap=4,
+        single_tile_reoptimize=True, laplace_neighbor_feedback=False)
+    np.testing.assert_array_equal(unw_fb, unw_nofb)
+    np.testing.assert_array_equal(cc_fb, cc_nofb)
+
+
+@gpu_only
 def test_reopt_default_off_unchanged(
     small_igram: np.ndarray, small_corr: np.ndarray
 ) -> None:

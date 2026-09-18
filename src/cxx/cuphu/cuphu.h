@@ -27,6 +27,14 @@ typedef enum {
     CUPHU_INIT_MST    = 0,
     CUPHU_INIT_MCF    = 1,
     CUPHU_INIT_LAPLACE = 2,   /* GPU Laplacian PCG — smooth mode only     */
+    CUPHU_INIT_WHIRLWIND = 3, /* CPU successive-shortest-paths solver over a
+                                 linear (Costantini/Carballo) cost, ported
+                                 from whirlwind-insar's validated
+                                 `unwrap_linear` -- smooth mode only. Fully
+                                 self-contained: its own Carballo/Lee-PDF
+                                 cost, capacity-1 network, soft masking (no
+                                 hard-forbidden arcs, no ground node). See
+                                 cuphu_whirlwind_solver.hpp.               */
 } CuPhuInitMethod;
 
 /* ── run-time parameters passed to the GPU pipeline ─────────────────────── */

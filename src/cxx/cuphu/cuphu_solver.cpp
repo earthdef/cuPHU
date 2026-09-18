@@ -19,6 +19,7 @@
  */
 
 #include "cuphu.h"
+#include "cuphu_whirlwind_solver.hpp"
 
 #include <cstring>
 #include <cstdlib>
@@ -502,6 +503,60 @@ static int solve_tile(
         TOCK("GPU conncomp");
 
         d_unw_lap.to_host(h_unw_tile);
+        d_conncomp.to_host(h_conncomp_tile);
+        TOCK("D2H download");
+
+        CUDA_CHECK(cudaStreamDestroy(stream));
+        return 0;
+    }
+
+    /* ── whirlwind CPU solver fast path (smooth mode only) ──────────────
+     *
+     * Bypasses cost download -> MCF/MST -> InitNetwork -> TreeSolve exactly
+     * like the laplace branch above. Unlike laplace this runs entirely on
+     * CPU (no GPU cost kernel involved) -- it reconstructs a unit-magnitude
+     * complex interferogram from the wrapped phase (this branch never had
+     * the original amplitude-preserving igram anyway; cuphu's own cost
+     * kernels only ever consume phase+corr too) and solves with its own
+     * self-contained Carballo/Lee-PDF cost + capacity-1 network + Dial's-
+     * algorithm SSP engine. See cuphu_whirlwind_solver.hpp.
+     */
+    if (init_meth == CUPHU_INIT_WHIRLWIND && !h_unw_seed_tile) {
+        if (cost_mode != CUPHU_COST_SMOOTH)
+            throw std::runtime_error("CUPHU_INIT_WHIRLWIND requires smooth cost mode");
+
+        std::vector<float> h_igram_r(npix), h_igram_i(npix);
+        for (size_t p = 0; p < npix; ++p) {
+            h_igram_r[p] = std::cos(h_phase_tile[p]);
+            h_igram_i[p] = std::sin(h_phase_tile[p]);
+        }
+        std::vector<float> h_unw_ww(npix);
+        int ww_rc = cuphu_whirlwind_unwrap(
+            h_igram_r.data(), h_igram_i.data(), h_corr_tile, h_mask_tile,
+            tile_nrow, tile_ncol, params->nlooks, h_unw_ww.data());
+        if (ww_rc != 0)
+            throw std::runtime_error("cuphu_whirlwind_unwrap failed");
+        TOCK("CPU whirlwind solve");
+
+        DevArray<float>    d_unw_ww(h_unw_ww.data(), npix);
+        DevArray<uint32_t> d_conncomp(npix);
+        DevArray<float>    d_corr2(h_corr_tile, npix);
+        DevArray<uint8_t>  d_mask_ww;
+        const uint8_t *mask_ww_ptr = nullptr;
+        if (h_mask_tile) {
+            d_mask_ww  = DevArray<uint8_t>(h_mask_tile, npix);
+            mask_ww_ptr = d_mask_ww.get();
+        }
+        cuphu_conncomp_gpu(
+            d_unw_ww.get(), d_corr2.get(), mask_ww_ptr,
+            tile_nrow, tile_ncol,
+            /*poscost=*/nullptr, /*negcost=*/nullptr,   /* no MCF solve in whirlwind init */
+            params,
+            gpu_id,
+            d_conncomp.get());
+        TOCK("GPU conncomp");
+
+        std::memcpy(h_unw_tile, h_unw_ww.data(), npix * sizeof(float));
         d_conncomp.to_host(h_conncomp_tile);
         TOCK("D2H download");
 

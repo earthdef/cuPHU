@@ -58,6 +58,6 @@ def check_cost_mode(cost: str) -> None:
 
 
 def check_init_method(init: str) -> None:
-    valid = {"mst", "mcf", "laplace"}
+    valid = {"mst", "mcf", "laplace", "whirlwind"}
     if init not in valid:
         raise ValueError(f"init must be one of {valid}, got {init!r}")

@@ -54,7 +54,8 @@ static CuPhuInitMethod parse_init_method(const std::string &s) {
     if (s == "mst")    return CUPHU_INIT_MST;
     if (s == "mcf")    return CUPHU_INIT_MCF;
     if (s == "laplace") return CUPHU_INIT_LAPLACE;
-    throw std::invalid_argument("init must be 'mst', 'mcf', or 'laplace'");
+    if (s == "whirlwind") return CUPHU_INIT_WHIRLWIND;
+    throw std::invalid_argument("init must be 'mst', 'mcf', 'laplace', or 'whirlwind'");
 }
 
 static CuPhuRampType parse_ramp_type(const py::object &obj) {

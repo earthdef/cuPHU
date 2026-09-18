@@ -64,6 +64,7 @@ set(CUPHU_CUDA_SOURCES
 
 set(CUPHU_CXX_SOURCES
   ${CUDA_SRC_DIR}/cuphu_solver.cpp
+  ${CUDA_SRC_DIR}/cuphu_whirlwind_solver.cpp
 )
 
 add_library(cuphu_core STATIC

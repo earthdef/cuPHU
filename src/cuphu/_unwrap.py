@@ -223,13 +223,23 @@ def unwrap(  # type: ignore[no-untyped-def]
         Equivalent number of independent looks (>= 1).
     cost : {'smooth', 'defo', 'topo'}, optional
         Statistical cost mode. Defaults to ``'smooth'``.
-    init : {'mcf', 'mst', 'laplace'}, optional
+    init : {'mcf', 'mst', 'laplace', 'whirlwind'}, optional
         Initialization algorithm for the unwrapped phase gradients.
         ``'mcf'``/``'mst'`` run SNAPHU's network-flow solver (CPU,
         exact). ``'laplace'`` instead solves a weighted-least-squares
         relaxation via Jacobi-preconditioned CG (GPU, approximate but
         much faster) -- see *ntiles* for why tiling matters for this mode
-        on large scenes. Defaults to ``'mcf'``.
+        on large scenes. ``'whirlwind'`` is a separate, self-contained CPU
+        solver (successive shortest paths with Dial's-algorithm Dijkstra
+        over a linear Costantini/Carballo cost, ported from the
+        whirlwind-insar project's validated ``unwrap_linear``): its own
+        cost model, capacity-1 network, and soft masking (no ground node,
+        no hard-forbidden arcs) -- not integrated with ``'mcf'``/``'mst'``/
+        ``'laplace'``'s shared machinery beyond the common per-tile solve
+        hook, so it inherits tiling/stitching/bridge automatically but
+        multi-tile use has not yet been validated for it (see the
+        implementation plan's Milestone 3). Smooth cost mode only.
+        Defaults to ``'mcf'``.
     mask : array_like, bool/uint8, 2-D, optional
         Binary valid-pixel mask. Zero means invalid. Defaults to None.
     mask_buffer : int, optional

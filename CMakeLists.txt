@@ -60,6 +60,7 @@ set(CUPHU_CUDA_SOURCES
   ${CUDA_SRC_DIR}/cuphu_incrcost.cu
   ${CUDA_SRC_DIR}/cuphu_negcycle.cu
   ${CUDA_SRC_DIR}/cuphu_laplace.cu
+  ${CUDA_SRC_DIR}/cuphu_whirlwind_cost_gpu.cu
 )
 
 set(CUPHU_CXX_SOURCES
@@ -89,6 +90,13 @@ target_compile_options(cuphu_core PRIVATE
 if(CUPHU_PROFILE)
   target_compile_definitions(cuphu_core PRIVATE CUPHU_PROFILE)
 endif()
+
+# init='whirlwind''s cost-LUT-lookup fast path (cuphu_whirlwind_cost_gpu.cu):
+# only meaningful inside this CUDA-linked target. cuphu_whirlwind_solver.cpp
+# also compiles standalone (plain g++, no CUDA) for fast-iteration testing
+# against Python whirlwind; that build never defines this macro and always
+# uses the CPU cost path.
+target_compile_definitions(cuphu_core PRIVATE CUPHU_WW_GPU_COST)
 
 target_link_libraries(cuphu_core PUBLIC
   snaphu_lib

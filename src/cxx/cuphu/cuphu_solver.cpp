@@ -533,7 +533,7 @@ static int solve_tile(
         std::vector<float> h_unw_ww(npix);
         int ww_rc = cuphu_whirlwind_unwrap(
             h_igram_r.data(), h_igram_i.data(), h_corr_tile, h_mask_tile,
-            tile_nrow, tile_ncol, params->nlooks, h_unw_ww.data());
+            tile_nrow, tile_ncol, params->nlooks, gpu_id, h_unw_ww.data());
         if (ww_rc != 0)
             throw std::runtime_error("cuphu_whirlwind_unwrap failed");
         TOCK("CPU whirlwind solve");

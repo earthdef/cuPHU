@@ -32,6 +32,11 @@
  * @param nrow     Number of pixel rows
  * @param ncol     Number of pixel columns
  * @param nlooks   Effective number of independent looks (>= 1)
+ * @param gpu_id   CUDA device to use for the cost-LUT-lookup fast path
+ *                 (only active when built with CUPHU_WW_GPU_COST -- the
+ *                 standalone/CPU-only build always uses the CPU path
+ *                 regardless of this value). -1 forces the CPU path even
+ *                 in a GPU-enabled build.
  * @param unw_out  Output unwrapped phase (radians), row-major, nrow*ncol
  * @return 0 on success, nonzero on failure (e.g. nrow/ncol < 2)
  */
@@ -43,5 +48,6 @@ int cuphu_whirlwind_unwrap(
     int                  nrow,
     int                  ncol,
     double               nlooks,
+    int                  gpu_id,
     float               *unw_out
 );

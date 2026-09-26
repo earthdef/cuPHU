@@ -2,6 +2,14 @@
 
 **CU**DA **PH**ase **U**nwrapping — GPU-accelerated InSAR phase unwrapping with multiple algorithms.
 
+## Which method should I use?
+
+- **Want an exact match to SNAPHU-MCF?** Use `init='mcf'` (the default) — validated bit-exact against snaphu-py, several times faster on a GPU.
+- **Want the fastest option and can tolerate near-noise-level approximation?** Use `init='laplace'` — the fastest GPU path here, and not subject to MCF/MST's CS2 noncommercial-use restriction (see License).
+- **Specifically want whirlwind-insar's algorithm, don't need isce3 integration, and don't already have a CUDA GPU?** Use [whirlwind-insar](https://github.com/scottstanie/whirlwind-insar) directly instead of cuPHU. `init='whirlwind'` here is a from-scratch, validated C++ port of the same algorithm, and its solve step never touches the GPU — but cuPHU as a package still requires a working CUDA GPU/runtime to import and run at all (see Requirements), so it is *not* a way to run whirlwind's algorithm on a GPU-less machine.
+- **Building or extending the NISAR/isce3 InSAR pipeline?** cuPHU is the natural fit regardless of which algorithm you pick — one native, GPU-integrated API across MCF, Laplace, and whirlwind, already wired into isce3's own workflow (see below).
+- **Not sure?** Start with the `mcf` default; switch to `laplace` if it's too slow on your scenes, or `whirlwind` if you'd rather avoid the CS2 dependency and don't mind its more conservative default connected-component labeling (see `conncomp_algorithm`/`conncomp_reliability` in the full signature).
+
 ## Algorithms
 
 cuPHU provides four unwrapping methods selectable via the `init` parameter.
@@ -25,7 +33,7 @@ family from MCF/MST/Laplace, not a GPU port of either.
 | **MCF** | `'mcf'` | GPU cost + CPU network-flow | Exact match to SNAPHU-MCF | **Recommended default.** Best when you need an exact match to SNAPHU (e.g. validation baselines). Auto-tiles with `nproc` for speed at scale. |
 | **MST** | `'mst'` | GPU cost + CPU spanning tree | To be tested | Not recommended until validated. |
 | **Laplace PCG** | `'laplace'` | Runs entirely on GPU | Match MCF to within noise on most scenes | Fastest GPU option, especially on large scenes (auto-tiles, no CPU threads needed). Prefer when speed matters most; `single_tile_reoptimize`/`fix_cycle_spikes` clean up tile-boundary and network-flow artifacts on any tiled run, regardless of `init` (isce3's own workflow defaults both on). |
-| **Whirlwind** | `'whirlwind'` | Runs entirely on CPU | Bit-exact match to whirlwind-insar's own output; ~54× faster than tiled MCF at MCF-matched coverage on a validated 240 Mpx NISAR scene | Fastest overall on CPU-only hosts or when a GPU isn't available for the solve step. Defaults to single-tile (exact, validated) like MCF/MST, but `nproc` defaults to all CPU cores — pass an explicit tiled `ntiles` to trade a small amount of tile-seam accuracy for a large speedup with zero extra config (see *Tiling* below). Its connected-component labeling is a genuinely different, more conservative reliability filter than MCF/Laplace's mask-driven conncomp — see `conncomp_algorithm`/`conncomp_reliability` in the full signature. |
+| **Whirlwind** | `'whirlwind'` | Runs entirely on CPU (still requires a CUDA GPU/runtime to import and run cuPHU at all, same as every other method — the solve step itself just never uses it) | Bit-exact match to whirlwind-insar's own output; ~54× faster than tiled MCF at MCF-matched coverage on a validated 240 Mpx NISAR scene | Prefer when you want to avoid MCF/MST's CS2 noncommercial-use restriction and don't need Laplace's GPU speed. Defaults to single-tile (exact, validated) like MCF/MST, but `nproc` defaults to all CPU cores — pass an explicit tiled `ntiles` to trade a small amount of tile-seam accuracy (measured 0.25-0.45% cycle disagreement on a validated 240 Mpx scene, `ntiles=(4,4)`) for a large speedup (measured 7.7-9.6×) with zero extra config (see *Tiling* below). Its connected-component labeling is a genuinely different, more conservative reliability filter than MCF/Laplace's mask-driven conncomp — see `conncomp_algorithm`/`conncomp_reliability` in the full signature. |
 
 
 ## Requirements
@@ -287,6 +295,8 @@ unw, conncomp = cuphu.unwrap(
 ```
 
 Tiling splits the cost computation and solve across tiles; GPU streams overlap with CPU solver work. Each tile gets its own connected-component labels; boundary stitching re-registers the tiles' absolute phase levels afterward. Optionally follow up with `single_tile_reoptimize=True` or `bridge=True` for further cleanup. For `init='whirlwind'`, note that `single_tile_reoptimize` costs about as much as a full single-tile solve (whirlwind always cold-solves; it doesn't get a warm-start speedup from the tiled seed the way MCF/Laplace's reoptimize does) — it corrects tile seams exactly, but roughly doubles total time versus just running single-tile whirlwind in the first place.
+
+**Multi-tile whirlwind, measured:** on a validated 240 Mpx NISAR scene, `ntiles=(4,4)` with `nproc=16` (the default) cut whirlwind's single-tile walltime from ~780-887s down to 89.5-101.3s — a 7.7-9.6× speedup — for a 0.25-0.45% cycle-disagreement at tile seams versus the single-tile result, plus per-tile (unmerged) connected-component labels at those seams. That disagreement is exact and bounded, not a correctness risk in the way an unvalidated approximation would be, but it means the tiled result is not bit-identical to single-tile the way tiled MCF/Laplace + reoptimize is expected to become. `single_tile_reoptimize=True` reconciles it exactly (validated bit-identical to single-tile) but, per the note above, costs roughly as much as the original single-tile solve — so for whirlwind, tiling is a speed/exactness tradeoff you opt into, not a strictly-better default the way it is for MCF/MST.
 
 ### Water masking and bridging
 

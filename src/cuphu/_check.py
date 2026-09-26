@@ -61,3 +61,11 @@ def check_init_method(init: str) -> None:
     valid = {"mst", "mcf", "laplace", "whirlwind"}
     if init not in valid:
         raise ValueError(f"init must be one of {valid}, got {init!r}")
+
+
+def check_conncomp_algorithm(conncomp_algorithm: str) -> None:
+    valid = {"linear", "snaphu"}
+    if conncomp_algorithm not in valid:
+        raise ValueError(
+            f"conncomp_algorithm must be one of {valid}, got {conncomp_algorithm!r}"
+        )

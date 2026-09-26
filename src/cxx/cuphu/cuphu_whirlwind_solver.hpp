@@ -10,8 +10,12 @@
  * unwrapped phase.
  *
  * This is the CUPHU_INIT_WHIRLWIND init path: fully self-contained, plugged
- * into cuphu_solver.cpp the same way CUPHU_INIT_LAPLACE is -- it computes
- * `unw` here and the caller runs the shared cuphu_conncomp_gpu() afterward.
+ * into cuphu_solver.cpp the same way CUPHU_INIT_LAPLACE is. Unlike laplace,
+ * conncomp is also computed here (whirlwind's own arc-cost-threshold
+ * `grow_components`, on the already-solved network) rather than deferred to
+ * the caller's shared cuphu_conncomp_gpu() -- that kernel's phase-diff+
+ * coherence-threshold rule doesn't have access to (or match) whirlwind's
+ * own cost/capacity data.
  *
  * Reference: whirlwind-insar crates/whirlwind-core/src/{lib,network,ssp,
  * primal_dual,grid,residue,integrate,cost/{mod,lut,lee_pdf,hyp2f1}}.rs.
@@ -38,6 +42,28 @@
  *                 regardless of this value). -1 forces the CPU path even
  *                 in a GPU-enabled build.
  * @param unw_out  Output unwrapped phase (radians), row-major, nrow*ncol
+ * @param conncomp_algorithm  0 = "linear" (default): cut an edge when a
+ *                 FRESH, solve-independent analytical Carballo cost is <=
+ *                 cost_threshold=50 (matches whirlwind-insar's
+ *                 conncomp_algorithm="linear" / ConnCompParams::default()).
+ *                 1 = "snaphu": ambiguity-wiggle reliability test on the
+ *                 solved phase (matches whirlwind-insar's
+ *                 conncomp_algorithm="snaphu", its own default choice).
+ *                 Both are validated bit-exact against whirlwind-insar's own
+ *                 implementation; NOT cuphu's shared phase-diff+coherence-
+ *                 threshold conncomp used by mcf/mst/laplace.
+ * @param reliability_threshold  "snaphu" mode only: cut when
+ *                 min(poscost,negcost) <= this (raw units,
+ *                 COST_SCALE*nshortcycle^2 scale). Matches whirlwind-insar's
+ *                 ww.unwrap() default of round(0.5 * 1e6) = 500000. Ignored
+ *                 in "linear" mode.
+ * @param thicken_cuts  "snaphu" mode only: SNAPHU ThickenCosts lateral cut-
+ *                 strength smoothing, so a thin reliable bridge through a
+ *                 wide unreliable band still gets cut. Matches whirlwind-
+ *                 insar's ww.unwrap() default of True. Ignored in "linear"
+ *                 mode.
+ * @param conncomp_out  Output connected-component labels (0 = background),
+ *                 row-major, nrow*ncol.
  * @return 0 on success, nonzero on failure (e.g. nrow/ncol < 2)
  */
 int cuphu_whirlwind_unwrap(
@@ -49,5 +75,9 @@ int cuphu_whirlwind_unwrap(
     int                  ncol,
     double               nlooks,
     int                  gpu_id,
-    float               *unw_out
+    float               *unw_out,
+    int                  conncomp_algorithm,
+    long                 reliability_threshold,
+    int                  thicken_cuts,
+    unsigned int        *conncomp_out
 );

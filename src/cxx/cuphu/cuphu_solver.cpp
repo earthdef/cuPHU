@@ -215,6 +215,9 @@ void cuphu_default_params(CuPhuParams *p) {
     p->minconncompfrac = DEF_MINCONNCOMPFRAC;
     p->conncompthresh  = DEF_CONNCOMPTHRESH;
     p->maxncomps       = DEF_MAXNCOMPS;
+    p->whirlwind_conncomp_snaphu = 0;       /* "linear" */
+    p->whirlwind_cc_reliability_thresh = 500000; /* matches ww.unwrap()'s own default */
+    p->whirlwind_cc_thicken = 1;             /* matches ww.unwrap()'s own default */
 }
 
 extern "C"
@@ -520,8 +523,22 @@ static int solve_tile(
      * kernels only ever consume phase+corr too) and solves with its own
      * self-contained Carballo/Lee-PDF cost + capacity-1 network + Dial's-
      * algorithm SSP engine. See cuphu_whirlwind_solver.hpp.
+     *
+     * Unlike laplace, this branch is NOT excluded when h_unw_seed_tile is
+     * present (single_tile_reoptimize's seeded whole-scene re-solve call):
+     * laplace is excluded there because PCG has a real smoothness-bleeding
+     * failure mode that reoptimize exists specifically to route around via
+     * a genuinely different (network-flow-style) algorithm; whirlwind's
+     * SSP/Dial's-algorithm solve is already such an algorithm (no PCG
+     * involved), so there is no correctness reason to force it through
+     * MCF/TreeSolve instead. The seed itself is unused -- whirlwind always
+     * cold-solves a fresh full-scene problem regardless of how it's
+     * invoked, and measured full-scene runs show this cold solve is
+     * already competitive with (or faster than) TreeSolve's own
+     * warm-started reoptimize pass, so there's no speed reason to route
+     * through TreeSolve here either.
      */
-    if (init_meth == CUPHU_INIT_WHIRLWIND && !h_unw_seed_tile) {
+    if (init_meth == CUPHU_INIT_WHIRLWIND) {
         if (cost_mode != CUPHU_COST_SMOOTH)
             throw std::runtime_error("CUPHU_INIT_WHIRLWIND requires smooth cost mode");
 
@@ -533,32 +550,14 @@ static int solve_tile(
         std::vector<float> h_unw_ww(npix);
         int ww_rc = cuphu_whirlwind_unwrap(
             h_igram_r.data(), h_igram_i.data(), h_corr_tile, h_mask_tile,
-            tile_nrow, tile_ncol, params->nlooks, gpu_id, h_unw_ww.data());
+            tile_nrow, tile_ncol, params->nlooks, gpu_id, h_unw_ww.data(),
+            params->whirlwind_conncomp_snaphu, params->whirlwind_cc_reliability_thresh,
+            params->whirlwind_cc_thicken, h_conncomp_tile);
         if (ww_rc != 0)
             throw std::runtime_error("cuphu_whirlwind_unwrap failed");
-        TOCK("CPU whirlwind solve");
-
-        DevArray<float>    d_unw_ww(h_unw_ww.data(), npix);
-        DevArray<uint32_t> d_conncomp(npix);
-        DevArray<float>    d_corr2(h_corr_tile, npix);
-        DevArray<uint8_t>  d_mask_ww;
-        const uint8_t *mask_ww_ptr = nullptr;
-        if (h_mask_tile) {
-            d_mask_ww  = DevArray<uint8_t>(h_mask_tile, npix);
-            mask_ww_ptr = d_mask_ww.get();
-        }
-        cuphu_conncomp_gpu(
-            d_unw_ww.get(), d_corr2.get(), mask_ww_ptr,
-            tile_nrow, tile_ncol,
-            /*poscost=*/nullptr, /*negcost=*/nullptr,   /* no MCF solve in whirlwind init */
-            params,
-            gpu_id,
-            d_conncomp.get());
-        TOCK("GPU conncomp");
+        TOCK("CPU whirlwind solve + conncomp");
 
         std::memcpy(h_unw_tile, h_unw_ww.data(), npix * sizeof(float));
-        d_conncomp.to_host(h_conncomp_tile);
-        TOCK("D2H download");
 
         CUDA_CHECK(cudaStreamDestroy(stream));
         return 0;

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import warnings
 from typing import overload
 
 import numpy as np
@@ -10,6 +11,7 @@ import numpy as np
 from cuphu._check import (
     check_bool_or_byte_dtype,
     check_complex_dtype,
+    check_conncomp_algorithm,
     check_cost_mode,
     check_float_dtype,
     check_init_method,
@@ -106,11 +108,14 @@ def unwrap(
     mask_buffer: int = _DEFAULT_MASK_BUFFER,
     mag: InputDataset | None = None,
     min_conncomp_frac: float = 0.01,
+    conncomp_algorithm: str = "linear",
+    conncomp_reliability: float = 0.5,
+    conncomp_thicken: bool = True,
     phase_grad_window: tuple[int, int] = (7, 7),
     ntiles: tuple[int, int] | None = None,
     tile_overlap: int | tuple[int, int] | None = None,
     target_tile_size: int = 1024,
-    nproc: int = 1,
+    nproc: int | None = None,
     tile_cost_thresh: int = 500,
     min_region_size: int = 100,
     single_tile_reoptimize: bool = False,
@@ -143,11 +148,14 @@ def unwrap(
     mask_buffer: int = _DEFAULT_MASK_BUFFER,
     mag: InputDataset | None = None,
     min_conncomp_frac: float = 0.01,
+    conncomp_algorithm: str = "linear",
+    conncomp_reliability: float = 0.5,
+    conncomp_thicken: bool = True,
     phase_grad_window: tuple[int, int] = (7, 7),
     ntiles: tuple[int, int] | None = None,
     tile_overlap: int | tuple[int, int] | None = None,
     target_tile_size: int = 1024,
-    nproc: int = 1,
+    nproc: int | None = None,
     tile_cost_thresh: int = 500,
     min_region_size: int = 100,
     single_tile_reoptimize: bool = False,
@@ -181,11 +189,14 @@ def unwrap(  # type: ignore[no-untyped-def]
     mask_buffer=_DEFAULT_MASK_BUFFER,
     mag=None,
     min_conncomp_frac=0.01,
+    conncomp_algorithm="linear",
+    conncomp_reliability=0.5,
+    conncomp_thicken=True,
     phase_grad_window=(7, 7),
     ntiles=None,
     tile_overlap=None,
     target_tile_size=1024,
-    nproc=1,
+    nproc=None,
     tile_cost_thresh=500,
     min_region_size=100,
     single_tile_reoptimize=False,
@@ -236,10 +247,18 @@ def unwrap(  # type: ignore[no-untyped-def]
         cost model, capacity-1 network, and soft masking (no ground node,
         no hard-forbidden arcs) -- not integrated with ``'mcf'``/``'mst'``/
         ``'laplace'``'s shared machinery beyond the common per-tile solve
-        hook, so it inherits tiling/stitching/bridge automatically but
-        multi-tile use has not yet been validated for it (see the
-        implementation plan's Milestone 3). Smooth cost mode only.
-        Defaults to ``'mcf'``.
+        hook, so it inherits tiling/stitching/bridge automatically.
+        Multi-tile use (with and without ``single_tile_reoptimize``) is
+        validated: bit-exact vs. its own single-tile result when reoptimize
+        is on, and a small but real cycle-disagreement at tile seams when
+        it is off. Unlike ``'mcf'``/``'mst'``, whirlwind has no correctness
+        reason to avoid single-tile at any scene size -- it cold-solves
+        large scenes directly at competitive speed -- so tiling here is a
+        pure throughput optimization, not a default: it stays single-tile
+        unless *ntiles* is passed explicitly, at which point *nproc*
+        defaults to all available cores with no extra configuration (see
+        *nproc* and *ntiles*). Smooth cost mode only. Defaults to
+        ``'mcf'``.
     mask : array_like, bool/uint8, 2-D, optional
         Binary valid-pixel mask. Zero means invalid. Defaults to None.
     mask_buffer : int, optional
@@ -280,6 +299,40 @@ def unwrap(  # type: ignore[no-untyped-def]
         Interferogram magnitude. Derived from *igram* if None.
     min_conncomp_frac : float, optional
         Minimum connected component size as a fraction of total pixels.
+        ``init='whirlwind'`` ignores this (see *conncomp_algorithm*).
+    conncomp_algorithm : {'linear', 'snaphu'}, optional
+        ``init='whirlwind'`` only; ignored otherwise. Which of
+        whirlwind-insar's own two connected-component algorithms to use,
+        both validated bit-exact against whirlwind-insar's own
+        implementation on real NISAR data:
+
+        - ``'linear'`` (default, preserves this function's long-standing
+          behavior): cuts a pixel edge when a fresh, solve-independent
+          analytical Carballo cost (the Lee 1994 multilook phase PDF's
+          log-likelihood ratio, cost_threshold=50) is at or below
+          threshold. Matches whirlwind-insar's
+          ``conncomp_algorithm='linear'``.
+        - ``'snaphu'``: SNAPHU's own ambiguity-wiggle reliability test --
+          perturbs the solved integer cycle count by +-1 at each edge and
+          measures how much a SNAPHU-style convex cost responds; an edge
+          near a cost-tie is unreliable and gets cut. This is
+          whirlwind-insar's own default (``ww.unwrap()`` always uses this
+          unless told otherwise), typically more discriminating on real,
+          heterogeneous scenes -- see *conncomp_reliability* and
+          *conncomp_thicken*.
+    conncomp_reliability : float, optional
+        ``init='whirlwind'`` with ``conncomp_algorithm='snaphu'`` only.
+        Fraction in [0, 1] scaling the raw reliability cut threshold
+        (``round(conncomp_reliability * 1e6)``, whirlwind-insar's own
+        units). Higher cuts more aggressively (smaller, more numerous
+        components). Defaults to 0.5, matching whirlwind-insar's
+        ``ww.unwrap()`` default.
+    conncomp_thicken : bool, optional
+        ``init='whirlwind'`` with ``conncomp_algorithm='snaphu'`` only.
+        SNAPHU's ``ThickenCosts`` lateral cut-strength smoothing, so a
+        one-pixel reliable bridge through a wide unreliable band still
+        gets cut. Defaults to True, matching whirlwind-insar's
+        ``ww.unwrap()`` default.
     phase_grad_window : (int, int), optional
         Size of the sliding window for averaging wrapped phase gradients
         in the (perpendicular, parallel) directions.
@@ -296,10 +349,18 @@ def unwrap(  # type: ignore[no-untyped-def]
         laplace (toward *target_tile_size*, not toward a tile count) --
         TreeSolve has no laplace-style correctness reason to tile, so this
         only happens to give the parallel tile solve something to
-        distribute across threads. Pass an explicit value to override any
-        default, including ``(1, 1)`` to force single-tile Laplace (fine,
-        even faster, for scenes already smaller than *target_tile_size*) or
-        single-tile MCF/MST regardless of *nproc*.
+        distribute across threads. ``init='whirlwind'`` is deliberately
+        excluded from this nproc-driven auto-tiling and always defaults to
+        single-tile ``(1, 1)`` regardless of *nproc* -- unlike mcf/mst it
+        always cold-solves (no warm-start benefit from a good seed), so
+        tiling it trades away the exact, validated single-tile result for
+        speed rather than being a free win; *nproc* still defaults to all
+        available cores for whirlwind (see *nproc*), so passing an explicit
+        tiled *ntiles* gets full parallelism with no extra configuration.
+        Pass an explicit value to override any default, including
+        ``(1, 1)`` to force single-tile Laplace (fine, even faster, for
+        scenes already smaller than *target_tile_size*) or single-tile
+        MCF/MST regardless of *nproc*.
     tile_overlap : int or (int, int) or None, optional
         Pixel overlap between adjacent tiles, used to register tiles
         against each other (median offset over the shared region). If
@@ -324,24 +385,50 @@ def unwrap(  # type: ignore[no-untyped-def]
         measured, throughput heuristic -- TreeSolve has no convergence
         dependence on tile size.
     nproc : int, optional
-        Maximum number of CPU threads for parallel tile network-flow solves
-        (``init='mcf'``/``'mst'`` only). If < 1, uses all available cores.
-        Also gates whether mcf/mst's own *ntiles* auto-tiling above runs at
-        all when *ntiles* is None -- set explicitly to 1 to keep
-        single-tile mcf/mst regardless of core count.
+        Maximum number of CPU threads for parallel tile solves
+        (``init='mcf'``/``'mst'``; also used for ``init='whirlwind'``
+        tile solves if *ntiles* is passed explicitly -- see *ntiles*
+        above, whirlwind does not auto-tile by default. No effect on
+        ``'laplace'``, which always tiles on GPU). If < 1, uses all
+        available cores. Also gates whether mcf/mst's own *ntiles*
+        auto-tiling above runs at all when *ntiles* is None -- set
+        explicitly to 1 to keep single-tile mcf/mst regardless of core
+        count. Defaults to 1 (single-tile unless *ntiles* is passed
+        explicitly) for ``'mcf'``/``'mst'``/``'laplace'``, but to all
+        available cores for ``init='whirlwind'`` specifically -- inert
+        unless *ntiles* is also passed explicitly (since whirlwind stays
+        single-tile by default regardless of *nproc*), but means an
+        explicit tiled *ntiles* gets full parallelism with no extra
+        configuration. Pass ``nproc=1`` explicitly to force a tiled
+        whirlwind run to solve its tiles one at a time instead.
     tile_cost_thresh : int, optional
         Cost threshold for determining reliable tile regions.
     min_region_size : int, optional
         Minimum number of pixels in a reliable tile region.
     single_tile_reoptimize : bool, optional
-        After tiled unwrapping and stitching, rerun a full CPU network-flow
-        solve (SNAPHU's exact TreeSolve, not the GPU-accelerated path) over
+        After tiled unwrapping and stitching, rerun a full CPU solve over
         the entire assembled scene as a single tile, seeded from the
-        stitched result, to clean up tile-boundary artifacts. Has no effect
-        when the effective tiling is ``(1, 1)`` -- including mcf/mst's own
-        ``nproc``-driven auto-tiling above, worth turning on together with
-        ``nproc`` > 1 if you want tiled-for-parallelism mcf/mst without its
-        tile-boundary stitching caveats.
+        stitched result, to clean up tile-boundary artifacts. For
+        ``init='mcf'``/``'mst'``/``'laplace'`` this reruns SNAPHU's exact
+        TreeSolve (not the GPU-accelerated path), which benefits from the
+        seed's warm start. For ``init='whirlwind'`` it reruns whirlwind's
+        own CPU solver instead -- but whirlwind always cold-solves (the
+        seed is unused), so this pass costs about the same as a from-scratch
+        whirlwind solve of the whole scene; it corrects tile seams exactly
+        (bit-identical to a single-tile solve, validated), but unlike
+        mcf/laplace it does not get cheaper by starting from a good seed,
+        so it roughly doubles total time versus just running whirlwind
+        single-tile in the first place. Has no effect when the effective
+        tiling is ``(1, 1)`` -- including mcf/mst's own ``nproc``-driven
+        auto-tiling above, worth turning on together with ``nproc`` > 1 if
+        you want tiled-for-parallelism mcf/mst without its tile-boundary
+        stitching caveats. For ``init='whirlwind'`` with an explicitly
+        tiled *ntiles* and this left ``False``, ``unwrap()`` emits a
+        ``UserWarning`` noting the resulting (small but real) tile-seam
+        cycle-disagreement and this option's cost tradeoff, since -- unlike
+        mcf/laplace -- whirlwind never auto-tiles on its own, so a tiled
+        call here was always an explicit choice worth flagging rather than
+        silently defaulting either way.
 
         cuPHU's own tile stitching (median 2π offset per tile pair,
         propagated via a spanning tree over tile adjacency) is
@@ -490,13 +577,22 @@ def unwrap(  # type: ignore[no-untyped-def]
 
     check_cost_mode(cost)
     check_init_method(init)
+    check_conncomp_algorithm(conncomp_algorithm)
 
     if nlooks < 1.0:
         raise ValueError(f"nlooks must be >= 1, got {nlooks}")
 
-    # normalize nproc first -- mcf/mst auto-tiling below needs the
+    # normalize nproc first -- mcf/mst/whirlwind auto-tiling below needs the
     # resolved value to decide whether tiling for parallelism is worth it.
-    if nproc < 1:
+    # None (the default) means "not specified": resolves to all available
+    # cores for init='whirlwind' (CPU-only, no correctness reason to prefer
+    # single-tile at any scene size, so parallelize by default), else 1
+    # (matches mcf/mst/laplace's long-standing single-tile-unless-asked
+    # default). An explicit integer (including 1) is always honored as-is,
+    # for every init method.
+    if nproc is None:
+        nproc = (os.cpu_count() or 1) if init == "whirlwind" else 1
+    elif nproc < 1:
         nproc = os.cpu_count() or 1
 
     # normalize tile_overlap -- same default for every init method (tiling
@@ -511,23 +607,47 @@ def unwrap(  # type: ignore[no-untyped-def]
     # normalize ntiles -- default depends on init: a single huge tile leaves
     # laplace's PCG solve unable to converge on large scenes (iteration count
     # scales with tile edge length), so auto-tile toward target_tile_size
-    # unless the caller passed an explicit ntiles. mcf/mst has no such
+    # unless the caller passed an explicit ntiles. mcf/mst have no such
     # correctness reason to tile, but a parallel tile solve (nproc > 1) has
     # nothing to distribute across without >1 tile, so auto-tile the same
     # way (toward target_tile_size, not toward nproc directly -- nproc just
     # gates whether it's worth tiling at all) when nproc > 1; nproc == 1
-    # (the default) stays single-tile.
+    # stays single-tile. whirlwind is deliberately EXCLUDED from this
+    # nproc-driven auto-tiling: unlike mcf/mst it always cold-solves (no
+    # warm-start advantage from a good seed), so tiling it trades away exact
+    # single-tile accuracy for speed, not a free win -- defaulting to
+    # ntiles=(1, 1) keeps the well-validated single-tile result the default
+    # even though nproc itself defaults to all cores for whirlwind (see
+    # nproc above); pass ntiles explicitly to opt into tiled-for-parallelism
+    # whirlwind (nproc's default then applies with no extra config needed).
     if ntiles is None:
         if init == "laplace":
             ntilerow, ntilecol = _auto_ntiles_by_target_size(
                 nrow, ncol, target_tile_size, row_ovrlp, col_ovrlp)
-        elif nproc > 1:
+        elif nproc > 1 and init != "whirlwind":
             ntilerow, ntilecol = _auto_ntiles_by_target_size(
                 nrow, ncol, target_tile_size, row_ovrlp, col_ovrlp)
         else:
             ntilerow, ntilecol = 1, 1
     else:
         ntilerow, ntilecol = int(ntiles[0]), int(ntiles[1])
+
+    if (init == "whirlwind" and ntilerow * ntilecol > 1
+            and not single_tile_reoptimize):
+        warnings.warn(
+            "init='whirlwind' with ntiles="
+            f"({ntilerow}, {ntilecol}) and single_tile_reoptimize=False: "
+            "tile seams will not be reconciled, leaving a small but real "
+            "cycle-disagreement at tile boundaries and separate, unmerged "
+            "connected-component labels per tile. Pass "
+            "single_tile_reoptimize=True "
+            "to fix this exactly -- note that for whirlwind (unlike "
+            "mcf/mst/laplace) this costs about as much as a full cold "
+            "single-tile solve, since whirlwind does not get a warm-start "
+            "speedup from the tiled seed, so it roughly doubles total "
+            "runtime rather than being a cheap cleanup pass.",
+            stacklevel=2,
+        )
 
     # ensure C-contiguous complex64 and float32
     igram_c64 = np.ascontiguousarray(igram, dtype=np.complex64)
@@ -588,6 +708,9 @@ def unwrap(  # type: ignore[no-untyped-def]
         kperpdpsi=kperpdpsi,
         kpardpsi=kpardpsi,
         min_conncomp_frac=float(min_conncomp_frac),
+        whirlwind_conncomp_algorithm=conncomp_algorithm,
+        whirlwind_cc_reliability_thresh=round(float(conncomp_reliability) * 1_000_000),
+        whirlwind_cc_thicken=bool(conncomp_thicken),
         ntilerow=ntilerow,
         ntilecol=ntilecol,
         tile_rowovrlp=row_ovrlp,

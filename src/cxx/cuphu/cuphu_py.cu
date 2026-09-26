@@ -92,7 +92,10 @@ static CuPhuParams make_params(
     double defomax,
     double min_conncomp_frac,
     long   max_ncomps,
-    long   conncompthresh
+    long   conncompthresh,
+    const std::string &whirlwind_conncomp_algorithm = "linear",
+    long   whirlwind_cc_reliability_thresh = 500000,
+    bool   whirlwind_cc_thicken = true
 ) {
     CuPhuParams p;
     cuphu_default_params(&p);
@@ -106,6 +109,17 @@ static CuPhuParams make_params(
     p.minconncompfrac= min_conncomp_frac;
     p.maxncomps      = max_ncomps;
     p.conncompthresh = conncompthresh;
+    if (whirlwind_conncomp_algorithm == "linear") {
+        p.whirlwind_conncomp_snaphu = 0;
+    } else if (whirlwind_conncomp_algorithm == "snaphu") {
+        p.whirlwind_conncomp_snaphu = 1;
+    } else {
+        throw std::runtime_error(
+            "conncomp_algorithm must be 'linear' or 'snaphu', got '"
+            + whirlwind_conncomp_algorithm + "'");
+    }
+    p.whirlwind_cc_reliability_thresh = whirlwind_cc_reliability_thresh;
+    p.whirlwind_cc_thicken = whirlwind_cc_thicken ? 1 : 0;
     return p;
 }
 
@@ -128,6 +142,9 @@ py::tuple py_unwrap_arrays(
     double  min_conncomp_frac = DEF_MINCONNCOMPFRAC,
     long    max_ncomps      = DEF_MAXNCOMPS,
     long    conncompthresh  = DEF_CONNCOMPTHRESH,
+    std::string whirlwind_conncomp_algorithm = "linear",
+    long    whirlwind_cc_reliability_thresh = 500000,
+    bool    whirlwind_cc_thicken = true,
     int     ntilerow        = 1,
     int     ntilecol        = 1,
     int     tile_rowovrlp   = 0,
@@ -201,7 +218,9 @@ py::tuple py_unwrap_arrays(
 
     CuPhuParams params = make_params(
         nlooks, costscale, nshortcycle, kperpdpsi, kpardpsi,
-        defomax, min_conncomp_frac, max_ncomps, conncompthresh);
+        defomax, min_conncomp_frac, max_ncomps, conncompthresh,
+        whirlwind_conncomp_algorithm, whirlwind_cc_reliability_thresh,
+        whirlwind_cc_thicken);
 
     CuPhuTileParams tile;
     cuphu_default_tile_params(&tile);
@@ -476,6 +495,9 @@ PYBIND11_MODULE(_cuphu_ext, m) {
         "min_conncomp_frac"_a = DEF_MINCONNCOMPFRAC,
         "max_ncomps"_a   = (long)DEF_MAXNCOMPS,
         "conncompthresh"_a    = (long)DEF_CONNCOMPTHRESH,
+        "whirlwind_conncomp_algorithm"_a = "linear",
+        "whirlwind_cc_reliability_thresh"_a = 500000L,
+        "whirlwind_cc_thicken"_a = true,
         "ntilerow"_a     = 1,
         "ntilecol"_a     = 1,
         "tile_rowovrlp"_a= 0,

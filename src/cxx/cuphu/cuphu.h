@@ -97,6 +97,24 @@ typedef struct CuPhuParams {
     double minconncompfrac;
     long   conncompthresh;
     long   maxncomps;
+
+    /* init='whirlwind' only: connected-component algorithm choice. cuphu's
+     * own whirlwind conncomp offers the same two algorithms whirlwind-insar
+     * itself does, and (like whirlwind-insar) they are validated bit-exact
+     * against it: "linear" (arc-cost threshold on a fresh, solve-
+     * independent analytical Carballo cost) or "snaphu" (ambiguity-wiggle
+     * reliability test on the solved phase, whirlwind-insar's own default).
+     * min/maxncomps above are shared with mcf/laplace; the two fields below
+     * are whirlwind-snaphu-specific and have no effect otherwise. */
+    int    whirlwind_conncomp_snaphu;      /* 0 = "linear" (default), 1 = "snaphu" */
+    long   whirlwind_cc_reliability_thresh; /* snaphu mode threshold (raw units,
+                                              * COST_SCALE*nshortcycle^2 scale);
+                                              * matches whirlwind-insar's own
+                                              * conncomp_reliability=0.5 default */
+    int    whirlwind_cc_thicken;           /* snaphu mode: SNAPHU ThickenCosts
+                                             * lateral cut-strength smoothing.
+                                             * Matches whirlwind-insar's own
+                                             * conncomp_thicken=True default. */
 } CuPhuParams;
 
 /* ── tile geometry ────────────────────────────────────────────────────────── */

@@ -37,6 +37,15 @@ extern "C" void cuphu_ww_cost_lut_eval_gpu(
     int32_t *h_cost_pos, int32_t *h_cost_neg);
 #endif
 
+#ifdef CUPHU_WW_GPU_DIAL
+extern "C" void cuphu_ww_dial_run_full_gpu(
+    int64_t m, int64_t n, int64_t n_v, int64_t n_h, int64_t num_forward,
+    const int32_t *h_excess, const int64_t *h_potential,
+    const uint16_t *h_cost_fwd, const uint8_t *h_is_saturated,
+    int64_t k, int gpu_id,
+    int64_t *h_dist_out, int64_t *h_pred_arc_out, uint8_t *h_popped_out);
+#endif
+
 namespace cuphu_ww {
 
 using std::size_t;
@@ -616,11 +625,42 @@ static int64_t max_reduced_cost(const Grid &g, const Network &net) {
 // Multi-source, full-completion Dial's Dijkstra: every reachable node is
 // popped and gets an exact finalized distance (matches
 // dial.rs::run_full_scratch_into).
+//
+// gpu_id >= 0 (and CUPHU_WW_GPU_DIAL defined) routes the relaxation loop
+// through cuphu_whirlwind_dial_gpu.cu instead of the CPU bucket loop below.
+// See that file's header for the deterministic-but-not-CPU-bit-exact
+// tie-break tradeoff this makes on flat-cost regions; augmentation
+// (pd_pass(), below) is unaffected either way.
 static void dial_run_full(const Grid &g, const Network &net, ShortestPaths &sp,
-                           std::vector<std::deque<uint32_t>> &buckets) {
+                           std::vector<std::deque<uint32_t>> &buckets, int gpu_id = -1) {
     sp.reset(net.num_nodes);
     int64_t max_rc = max_reduced_cost(g, net);
     int64_t k = std::max<int64_t>(max_rc + 1, 1);
+#ifdef CUPHU_WW_GPU_DIAL
+    // Runtime opt-in on top of the compile-time gate: this path is new and
+    // experimental (see cuphu_whirlwind_dial_gpu.cu's header), so compiling
+    // it in must not silently change default behavior -- only an explicit
+    // CUPHU_WW_GPU_DIAL=1 env var actually routes through it.
+    if (gpu_id >= 0 && std::getenv("CUPHU_WW_GPU_DIAL")) {
+        bool dbg = std::getenv("CUPHU_WW_DEBUG") != nullptr;
+        auto t0 = std::chrono::steady_clock::now();
+        std::vector<uint8_t> popped_u8((size_t)net.num_nodes);
+        cuphu_ww_dial_run_full_gpu(
+            g.m, g.n, g.n_v, g.n_h, g.num_forward,
+            net.excess.data(), net.potential.data(),
+            net.cost_fwd.data(), net.is_saturated.data(),
+            k, gpu_id,
+            sp.dist.data(), sp.pred_arc.data(), popped_u8.data());
+        for (int64_t v = 0; v < net.num_nodes; ++v) sp.popped[(size_t)v] = popped_u8[(size_t)v];
+        if (dbg) {
+            double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            std::fprintf(stderr, "[dial_run_full_gpu] %.3fs\n", dt);
+        }
+        return;
+    }
+#else
+    (void)gpu_id;
+#endif
     // Caller-owned scratch (matches dial.rs::run_full_scratch_into): reused
     // across calls instead of allocating up to ~k std::deques fresh every
     // pd_pass -- with costs capped around 6908 (parity spline LUT), k can
@@ -685,8 +725,8 @@ static void dial_run_full(const Grid &g, const Network &net, ShortestPaths &sp,
 // One multi-source PD pass: Dijkstra, augment one unit per available source,
 // update potentials. Returns the number of units augmented.
 static int64_t pd_pass(const Grid &g, Network &net, ShortestPaths &sp,
-                        std::vector<std::deque<uint32_t>> &buckets) {
-    dial_run_full(g, net, sp, buckets);
+                        std::vector<std::deque<uint32_t>> &buckets, int gpu_id = -1) {
+    dial_run_full(g, net, sp, buckets, gpu_id);
 
     std::vector<int64_t> deficits;
     for (int64_t v = 0; v < net.num_nodes; ++v)
@@ -703,8 +743,10 @@ static int64_t pd_pass(const Grid &g, Network &net, ShortestPaths &sp,
     static thread_local uint32_t epoch = 0;
     if ((int64_t)visited_epoch.size() != net.num_nodes)
         visited_epoch.assign((size_t)net.num_nodes, 0);
+    int64_t n_popped_sinks = 0, n_cyc = 0, n_empty = 0, n_src_not_excess = 0;
     for (int64_t sink : deficits) {
         if (!sp.popped[(size_t)sink]) continue;
+        ++n_popped_sinks;
         std::vector<int64_t> arcs;
         int64_t cur = sink;
         if (++epoch == 0) { std::fill(visited_epoch.begin(), visited_epoch.end(), 0); epoch = 1; }
@@ -719,8 +761,19 @@ static int64_t pd_pass(const Grid &g, Network &net, ShortestPaths &sp,
             if (visited_epoch[(size_t)cur] == epoch) { cyc = true; break; }
             visited_epoch[(size_t)cur] = epoch;
         }
-        if (!cyc && !arcs.empty()) paths.push_back({sink, cur, std::move(arcs)});
+        if (cyc) ++n_cyc;
+        else if (arcs.empty()) ++n_empty;
+        else {
+            if (net.excess[(size_t)cur] <= 0) ++n_src_not_excess;
+            paths.push_back({sink, cur, std::move(arcs)});
+        }
     }
+    if (std::getenv("CUPHU_WW_DEBUG"))
+        std::fprintf(stderr,
+            "[pd_pass] deficits=%zu popped_sinks=%lld cyc=%lld empty=%lld "
+            "src_not_excess=%lld paths=%zu\n",
+            deficits.size(), (long long)n_popped_sinks, (long long)n_cyc,
+            (long long)n_empty, (long long)n_src_not_excess, paths.size());
     // Deterministic order: by (source, dist[sink]). MUST be a stable sort --
     // matches Rust's `sort_by_key` (stable by spec). In a degenerate region
     // (e.g. a large masked block: uniform cost=0 everywhere), many sinks can
@@ -993,7 +1046,8 @@ static void drain_residual_bfs(const Grid &g, Network &net) {
 // progress. `sp`/`buckets` are caller-owned scratch, reused across calls.
 static int run_pd_passes(const Grid &g, Network &net, ShortestPaths &sp,
                           std::vector<std::deque<uint32_t>> &buckets,
-                          int max_iter, int64_t &last_excess, bool dbg, const char *tag) {
+                          int max_iter, int64_t &last_excess, bool dbg, const char *tag,
+                          int gpu_id = -1) {
     int iter = 0;
     for (; iter < max_iter; ++iter) {
         int64_t excess_total = total_excess_magnitude(net, true);
@@ -1002,7 +1056,7 @@ static int run_pd_passes(const Grid &g, Network &net, ShortestPaths &sp,
         if (excess_total >= last_excess) break;
         last_excess = excess_total;
         auto tpd0 = std::chrono::steady_clock::now();
-        pd_pass(g, net, sp, buckets);
+        pd_pass(g, net, sp, buckets, gpu_id);
         if (dbg) {
             double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - tpd0).count();
             std::fprintf(stderr, "[solve] %s iter=%d excess=%lld deficit=%lld (%.3fs)\n",
@@ -1039,7 +1093,7 @@ static int run_pd_passes(const Grid &g, Network &net, ShortestPaths &sp,
 // real residual -- which is exactly when whirlwind's own resume loop is
 // designed to trigger (it's a no-op, by construction, whenever excess
 // already reached 0).
-static void solve(const Grid &g, Network &net) {
+static void solve(const Grid &g, Network &net, int gpu_id = -1) {
     bool dbg = std::getenv("CUPHU_WW_DEBUG") != nullptr;
     if (dbg) {
         int64_t ex0 = total_excess_magnitude(net, true);
@@ -1052,7 +1106,7 @@ static void solve(const Grid &g, Network &net) {
     std::vector<std::deque<uint32_t>> buckets;
     int64_t last_excess = std::numeric_limits<int64_t>::max();
     auto ts0 = std::chrono::steady_clock::now();
-    int iter = run_pd_passes(g, net, sp, buckets, 8, last_excess, dbg, "after pd_pass");
+    int iter = run_pd_passes(g, net, sp, buckets, 8, last_excess, dbg, "after pd_pass", gpu_id);
     if (dbg) {
         double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - ts0).count();
         std::fprintf(stderr, "[solve] PD loop done after %d iters, excess=%lld (PD total %.3fs)\n",
@@ -1086,7 +1140,7 @@ static void solve(const Grid &g, Network &net) {
             int64_t before = total_excess_magnitude(net, true);
             int chunk = std::min(16, cap - total);
             int64_t chunk_last_excess = std::numeric_limits<int64_t>::max();
-            run_pd_passes(g, net, sp, buckets, chunk, chunk_last_excess, false, "resume");
+            run_pd_passes(g, net, sp, buckets, chunk, chunk_last_excess, false, "resume", gpu_id);
             total += chunk;
             ++rounds;
             int64_t after = total_excess_magnitude(net, true);
@@ -1967,7 +2021,7 @@ int cuphu_whirlwind_unwrap(
 
     Network net(g, std::move(residues), costs);
     tock("network");
-    solve(g, net);
+    solve(g, net, gpu_id);
     tock("solve");
     integrate(g, net, wrapped.data(), m_phase, n_phase, unw_out);
     tock("integrate");

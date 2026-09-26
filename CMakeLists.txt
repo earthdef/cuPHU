@@ -61,6 +61,7 @@ set(CUPHU_CUDA_SOURCES
   ${CUDA_SRC_DIR}/cuphu_negcycle.cu
   ${CUDA_SRC_DIR}/cuphu_laplace.cu
   ${CUDA_SRC_DIR}/cuphu_whirlwind_cost_gpu.cu
+  ${CUDA_SRC_DIR}/cuphu_whirlwind_dial_gpu.cu
 )
 
 set(CUPHU_CXX_SOURCES
@@ -97,6 +98,16 @@ endif()
 # against Python whirlwind; that build never defines this macro and always
 # uses the CPU cost path.
 target_compile_definitions(cuphu_core PRIVATE CUPHU_WW_GPU_COST)
+
+# Experimental GPU port of dial_run_full()'s relaxation step
+# (cuphu_whirlwind_dial_gpu.cu) -- compiled in but off by default at
+# runtime (only active when CUPHU_WW_GPU_DIAL=1 is also set in the
+# environment), since it trades the CPU path's bit-exact tie-breaking for a
+# different deterministic rule (see that file's header). Not yet validated
+# end-to-end; keep this compiled in for testing, but do not remove the
+# runtime gate in cuphu_whirlwind_solver.cpp without re-reading why it's
+# there.
+target_compile_definitions(cuphu_core PRIVATE CUPHU_WW_GPU_DIAL)
 
 target_link_libraries(cuphu_core PUBLIC
   snaphu_lib

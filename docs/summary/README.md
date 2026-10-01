@@ -9,7 +9,7 @@ cuPHU has a SNAPHU-compatible, snaphu-py-style Python API, and it is wired into 
 - benchmark results, including a 240 Mpx NISAR scene
 - the limitations of multi-tile unwrapping
 - why development ended in favor of whirlwind
-- a proposed new default for whirlwind's connected-component reliability threshold
+- connected-component reliability settings for the whirlwind path
 
 ## 1. Unwrapping algorithms in cuPHU and how they were ported
 
@@ -140,38 +140,22 @@ Because single-tile whirlwind is already fast enough at full-scene size, the sim
   - is maintained upstream by its author
 - Keeping a separate C++ port of whirlwind inside cuPHU would duplicate that upstream effort.
 
-cuPHU stays available as-is, together with the ISCE3 `cuphu` branch. Its validation results and notes remain as a reference, including the SNAPHU-exact GPU MCF path. No further development is planned. Two items are worth carrying over to whirlwind: region-level tile stitching (if tiling is ever needed), and the conncomp default below.
+cuPHU stays available as-is, together with the ISCE3 `cuphu` branch. Its validation results and notes remain as a reference, including the SNAPHU-exact GPU MCF path. No further development is planned. One item is worth carrying over to whirlwind: region-level tile stitching, if tiling is ever needed.
 
-## 5. Proposed whirlwind default: `conncomp_reliability = 0.1`
+## 5. Connected-component reliability (whirlwind)
 
-With `conncomp_algorithm='snaphu'` and `conncomp_thicken=True`, whirlwind-insar's Python wrapper currently defaults to `conncomp_reliability=0.5`. The value is an inverse phase variance, and it maps to a raw threshold of 500,000. On the Venezuela scene this default is far more conservative than SNAPHU. Both runs below come from the same solve and differ only in the conncomp post-pass, so the unwrapped phase is identical:
+For `init='whirlwind'` with `conncomp_algorithm='snaphu'`, the connected components are a reliability filter on the solved phase. The threshold can be set in two ways:
+- **`conncomp_reliability`**, in inverse-variance ($1/\sigma^2$) units. It defaults to 0.5, matching whirlwind-insar's Python default.
+- **`conncomp_min_coherence`**, a target minimum coherence that overrides `conncomp_reliability`. It is converted with the Just/Bamler phase-noise model, $1/\sigma^2 = 2L\gamma^2/(1-\gamma^2)$ for $L$ looks. `'auto'` uses $\gamma = 0.32/\sqrt{L}$, the setting in ISCE3's NISAR defaults, which gives a reliability of about 0.21 at any number of looks.
 
-| Full scene, same solve | Components | Land labeled |
-|---|---:|---:|
-| `conncomp_reliability = 0.5` (current, Fig. 3) | 99 | 41.2% |
-| **`conncomp_reliability = 0.1` (proposed, Fig. 1)** | **1** | **92.8%** |
-| cuPHU/SNAPHU MCF, 1 tile, for comparison | 2 | 93.8% |
-| `conncomp_algorithm = 'linear'` | 80 | 32.1% |
+Results at 0.5 and 0.1 on the Venezuela scene come from the same solve and differ only in the conncomp post-pass, so the unwrapped phase is identical:
 
-A sweep on a 5000×4500 crop gives:
+| `conncomp_reliability` | Full scene: components | Full scene: land labeled | 5000×4500 crop: components | Crop: labeled |
+|---:|---:|---:|---:|---:|
+| 0.5 (Fig. 3) | 99 | 41.2% | 154 | 21.5% |
+| 0.1 (Fig. 1) | 1 | 92.8% | 8 | 49.3% |
 
-| Reliability | Components | Labeled |
-|---:|---:|---:|
-| 0.5 | 154 | 21.5% |
-| 0.2 | 22 | 42.9% |
-| **0.1** | **8** | **49.3%** |
-| 0.02 | 106 | 85.6% |
-| ≤ 0.005 | ~11 | ~91% |
-
-On the same crop MCF labels 49.4%. So at 0.1, whirlwind's labeled area matches SNAPHU's on land and the large islands merge into one component. It still rejects decorrelated water even without an ocean mask: only 0.13% of ocean pixels are labeled. Looser values keep adding coverage well past MCF's. That is most likely the filter starting to accept unmasked water and other noise. The threshold only affects a cheap post-pass, so runtime does not change.
-
-The recommendation is 0.1 as the new default, subject to a check on the 13-frame NISAR set in whirlwind's own comparison. The calibration there so far was done with water masked out beforehand.
-
-**Note added:** The 0.5 above is whirlwind-insar's own Python default. ISCE3's NISAR defaults instead set `conncomp_min_coherence: auto`, which takes precedence over `conncomp_reliability: 0.5`. Whirlwind turns that setting into a reliability threshold in two steps:
-- `auto` sets a coherence floor of $\gamma = 0.32/\sqrt{L}$ for $L$ looks.
-- That floor is converted to a reliability with the Just/Bamler phase-noise model, $1/\sigma^2 = 2L\gamma^2/(1-\gamma^2)$.
-
-The result is about 0.21 at any number of looks (0.208 at 7.43 looks, 0.206 at 16). That is already well below 0.5. On the crop above, 0.2 gives 22 components and 42.9% labeled, between the 0.5 default and 0.1. Reaching 0.1 in ISCE3 means `conncomp_min_coherence` ≈ 0.08 at 7.43 looks, or equivalently changing the `auto` constant from 0.32 to about 0.22.
+At 0.1, the reliable islands merge into one component covering almost all land, while decorrelated water stays unlabeled even without an ocean mask (0.13% of ocean pixels labeled). At 0.5, most land is left unlabeled, split into 99 separate components. The threshold only affects a cheap post-pass, so runtime is the same.
 
 ![Fig. 1](fig1_whirlwind_singletile_rel0.1.jpg)
 
@@ -179,7 +163,7 @@ The result is about 0.21 at any number of looks (0.208 at 7.43 looks, 0.206 at 1
 
 ![Fig. 3](fig3_whirlwind_singletile_rel0.5.jpg)
 
-*Fig. 3. The same solve as Fig. 1 with the current default `conncomp_reliability=0.5`.*
+*Fig. 3. The same solve as Fig. 1 with `conncomp_reliability=0.5`, the default.*
 
 ---
 

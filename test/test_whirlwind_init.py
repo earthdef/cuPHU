@@ -165,3 +165,51 @@ def test_tiled_matches_single_tile(ntiles, rng: np.random.Generator):
     _, resid_std, disagree_pct = _cycle_agreement(unw_ref, unw_tiled, valid)
     assert disagree_pct < 1.0
     assert resid_std < 0.1
+
+
+# ── conncomp_min_coherence ──────────────────────────────────────────────────
+
+@needs_whirlwind
+@pytest.mark.parametrize("nlooks", [1.0, 4.0, 7.43, 16.0, 100.0, 1000.0])
+def test_min_coherence_helpers_match_python_whirlwind(nlooks):
+    from cuphu._unwrap import _conncomp_min_coherence_auto, _reliability_from_coherence
+
+    assert _conncomp_min_coherence_auto(nlooks) == pytest.approx(
+        _ww.conncomp_min_coherence_auto(nlooks))
+    for gamma in [1e-4, 0.05, 0.1, 0.3, 0.9, 0.9999]:
+        assert _reliability_from_coherence(gamma, nlooks) == pytest.approx(
+            _ww.conncomp_reliability_from_coherence(gamma, nlooks))
+
+
+@gpu_only
+def test_min_coherence_overrides_reliability(rng: np.random.Generator):
+    from cuphu._unwrap import _reliability_from_coherence
+
+    _, igram, corr = _synth_igram(64, 64, gamma=0.6, nlooks=4, rng=rng)
+    kw = dict(nlooks=4.0, init="whirlwind", conncomp_algorithm="snaphu")
+    _, cc_gamma = cuphu.unwrap(igram, corr, conncomp_min_coherence=0.3,
+                               conncomp_reliability=0.5, **kw)
+    _, cc_rel = cuphu.unwrap(igram, corr,
+                             conncomp_reliability=_reliability_from_coherence(0.3, 4.0), **kw)
+    np.testing.assert_array_equal(cc_gamma, cc_rel)
+
+
+@gpu_only
+@needs_whirlwind
+def test_min_coherence_auto_matches_python_whirlwind():
+    rng = np.random.default_rng(5)
+    _, igram, corr = _synth_igram(64, 64, gamma=0.6, nlooks=4, rng=rng)
+
+    _, cc_cuphu = cuphu.unwrap(igram, corr, nlooks=4.0, init="whirlwind",
+                               conncomp_algorithm="snaphu", conncomp_min_coherence="auto")
+    _, cc_py = _ww.unwrap(igram, corr, nlooks=4.0, conncomp_min_coherence="auto")
+    np.testing.assert_array_equal(cc_cuphu > 0, cc_py > 0)
+
+
+@gpu_only
+@pytest.mark.parametrize("value", ["bogus", 0.0, 1.0])
+def test_min_coherence_rejects_invalid(value, rng: np.random.Generator):
+    _, igram, corr = _synth_igram(16, 16, gamma=0.9, nlooks=4, rng=rng)
+    with pytest.raises(ValueError, match="conncomp_min_coherence"):
+        cuphu.unwrap(igram, corr, nlooks=4.0, init="whirlwind",
+                     conncomp_algorithm="snaphu", conncomp_min_coherence=value)

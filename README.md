@@ -233,6 +233,7 @@ cuphu.unwrap(
     mag=None,                 # float32 amplitude (derived from igram if None)
     min_conncomp_frac=0.01,   # minimum connected component as fraction of total (not init='whirlwind')
     conncomp_algorithm="linear",  # 'linear' | 'snaphu'  (init='whirlwind' only)
+    conncomp_min_coherence=None,  # float or 'auto' (0.32/sqrt(nlooks)); overrides conncomp_reliability (whirlwind + snaphu only)
     conncomp_reliability=0.5, # reliability threshold (init='whirlwind' + conncomp_algorithm='snaphu' only)
     conncomp_thicken=True,    # SNAPHU-style cut thickening (init='whirlwind' + conncomp_algorithm='snaphu' only)
     phase_grad_window=(7, 7), # boxcar averaging window for wrapped gradients

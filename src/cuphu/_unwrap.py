@@ -36,6 +36,19 @@ _DEFAULT_TILE_OVERLAP = 64
 _DEFAULT_MASK_BUFFER = 64
 
 
+def _conncomp_min_coherence_auto(nlooks):
+    """Looks-aware coherence floor, 0.32/sqrt(nlooks) clipped to [0.02, 0.30]
+    (whirlwind-insar's ``conncomp_min_coherence_auto``)."""
+    return min(max(0.32 / nlooks ** 0.5, 0.02), 0.30)
+
+
+def _reliability_from_coherence(coherence, nlooks):
+    """1/sigma2 at *coherence* under the Just/Bamler phase-noise model
+    (whirlwind-insar's ``conncomp_reliability_from_coherence``)."""
+    g = min(max(coherence, 1e-3), 0.999)
+    return 2.0 * nlooks * g * g / (1.0 - g * g)
+
+
 def _auto_ntiles_by_target_size(nrow, ncol, target_tile_size, row_ovrlp, col_ovrlp):
     """Choose (ntilerow, ntilecol) so every tile has close to the *same*
     edge length in both directions, near target_tile_size (including
@@ -109,6 +122,7 @@ def unwrap(
     mag: InputDataset | None = None,
     min_conncomp_frac: float = 0.01,
     conncomp_algorithm: str = "linear",
+    conncomp_min_coherence: float | str | None = None,
     conncomp_reliability: float = 0.5,
     conncomp_thicken: bool = True,
     phase_grad_window: tuple[int, int] = (7, 7),
@@ -149,6 +163,7 @@ def unwrap(
     mag: InputDataset | None = None,
     min_conncomp_frac: float = 0.01,
     conncomp_algorithm: str = "linear",
+    conncomp_min_coherence: float | str | None = None,
     conncomp_reliability: float = 0.5,
     conncomp_thicken: bool = True,
     phase_grad_window: tuple[int, int] = (7, 7),
@@ -190,6 +205,7 @@ def unwrap(  # type: ignore[no-untyped-def]
     mag=None,
     min_conncomp_frac=0.01,
     conncomp_algorithm="linear",
+    conncomp_min_coherence=None,
     conncomp_reliability=0.5,
     conncomp_thicken=True,
     phase_grad_window=(7, 7),
@@ -320,13 +336,22 @@ def unwrap(  # type: ignore[no-untyped-def]
           unless told otherwise), typically more discriminating on real,
           heterogeneous scenes -- see *conncomp_reliability* and
           *conncomp_thicken*.
+    conncomp_min_coherence : float or 'auto' or None, optional
+        ``init='whirlwind'`` with ``conncomp_algorithm='snaphu'`` only.
+        Target minimum coherence for connected components; when set, it
+        takes precedence over *conncomp_reliability*, which is derived from
+        it as ``1/sigma2`` under the Just/Bamler phase-noise model.
+        ``'auto'`` uses ``0.32/sqrt(nlooks)`` clipped to [0.02, 0.30]
+        (about 0.21 in *conncomp_reliability* units at any nlooks), the
+        setting ISCE3's NISAR defaults use. Defaults to None (use
+        *conncomp_reliability*), matching whirlwind-insar's ``ww.unwrap()``.
     conncomp_reliability : float, optional
         ``init='whirlwind'`` with ``conncomp_algorithm='snaphu'`` only.
-        Fraction in [0, 1] scaling the raw reliability cut threshold
-        (``round(conncomp_reliability * 1e6)``, whirlwind-insar's own
-        units). Higher cuts more aggressively (smaller, more numerous
-        components). Defaults to 0.5, matching whirlwind-insar's
-        ``ww.unwrap()`` default.
+        Reliability cut threshold in inverse-variance (``1/sigma2``) units,
+        passed to the solver as ``round(conncomp_reliability * 1e6)``.
+        Higher cuts more aggressively (smaller, more numerous components).
+        Ignored if *conncomp_min_coherence* is set. Defaults to 0.5,
+        matching whirlwind-insar's ``ww.unwrap()`` default.
     conncomp_thicken : bool, optional
         ``init='whirlwind'`` with ``conncomp_algorithm='snaphu'`` only.
         SNAPHU's ``ThickenCosts`` lateral cut-strength smoothing, so a
@@ -578,6 +603,19 @@ def unwrap(  # type: ignore[no-untyped-def]
     check_cost_mode(cost)
     check_init_method(init)
     check_conncomp_algorithm(conncomp_algorithm)
+    if conncomp_min_coherence is not None:
+        if isinstance(conncomp_min_coherence, str):
+            if conncomp_min_coherence != "auto":
+                raise ValueError(
+                    "conncomp_min_coherence must be a float, 'auto', or None, "
+                    f"got {conncomp_min_coherence!r}")
+            gamma = _conncomp_min_coherence_auto(float(nlooks))
+        else:
+            gamma = float(conncomp_min_coherence)
+            if not 0.0 < gamma < 1.0:
+                raise ValueError(
+                    f"conncomp_min_coherence must be in (0, 1), got {gamma}")
+        conncomp_reliability = _reliability_from_coherence(gamma, float(nlooks))
 
     if nlooks < 1.0:
         raise ValueError(f"nlooks must be >= 1, got {nlooks}")

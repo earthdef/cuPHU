@@ -167,6 +167,12 @@ On the same crop MCF labels 49.4%. So at 0.1, whirlwind's labeled area matches S
 
 The recommendation is 0.1 as the new default, subject to a check on the 13-frame NISAR set in whirlwind's own comparison. The calibration there so far was done with water masked out beforehand.
 
+**Note added:** The 0.5 above is whirlwind-insar's own Python default. ISCE3's NISAR defaults instead set `conncomp_min_coherence: auto`, which takes precedence over `conncomp_reliability: 0.5`. Whirlwind turns that setting into a reliability threshold in two steps:
+- `auto` sets a coherence floor of $\gamma = 0.32/\sqrt{L}$ for $L$ looks.
+- That floor is converted to a reliability with the Just/Bamler phase-noise model, $1/\sigma^2 = 2L\gamma^2/(1-\gamma^2)$.
+
+The result is about 0.21 at any number of looks (0.208 at 7.43 looks, 0.206 at 16). That is already well below 0.5. On the crop above, 0.2 gives 22 components and 42.9% labeled, between the 0.5 default and 0.1. Reaching 0.1 in ISCE3 means `conncomp_min_coherence` ≈ 0.08 at 7.43 looks, or equivalently changing the `auto` constant from 0.32 to about 0.22.
+
 ![Fig. 1](fig1_whirlwind_singletile_rel0.1.jpg)
 
 *Fig. 1. Single-tile whirlwind-insar on the Venezuela scene with `conncomp_reliability=0.1`: unwrapped phase (left) and connected components (right). 874.5 s on CPU.*

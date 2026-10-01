@@ -52,14 +52,12 @@ cuPHU exposes four solvers through one `init=` argument.
 
 cuPHU also ships optional post-processing:
 - `single_tile_reoptimize`
-- a native port of ISCE3's phase bridging, which reconciles whole-cycle offsets between regions a mask splits apart
+- native phase bridging (`bridge=True`), which reconciles whole-cycle offsets between regions a mask splits apart. It is a GPU/C++ port of ISCE3's bridging algorithm:
+  - region labeling, erosion and boundary extraction run on the GPU
+  - each region's boundary is capped at `bridge_max_boundary_samples` points
+  - a grid-based nearest-region search on the GPU replaces all-pairs KD-tree queries, so the cost stays low on heavily fragmented scenes
+  - the bridge tree and per-bridge medians are computed on the CPU, with optional ramp removal (`bridge_ramp_type`)
 - `reference_pixel` alignment
-
-Validating the bridging port against ISCE3's reference `bridge_phase.py` turned up bugs in the reference itself. The fixes are on the ISCE3 `cuphu` branch:
-- **Regions dropped.** The erosion-survival check compared a binary max against label ids, which silently dropped every region but one.
-- **Erosion settings ignored.** The erosion structuring element was a square instead of the intended circle, and `erosion_size` was never passed through to the labeling step.
-- **Hang on fragmented scenes.** Nearest-point search between regions built KD-trees over every pixel of each region instead of only its boundary; the boundary array meant for this was always empty. On the 240 Mpx Venezuela scene, split into 928 regions, bridging never finished in 75+ minutes. With the fix it finishes in about 10 minutes. cuPHU's GPU port avoids this scaling problem by design, using a grid-based nearest-region search.
-- **Water mask inverted.** Separately, `binarize_nisar_water_mask()` in `water_mask.py` treated land as water.
 
 It handles these kinds of masks:
 - **Any user-supplied valid-pixel mask** (`mask=`, bool or uint8, where 0 means invalid). MCF, MST and Laplace treat masked pixels as hard exclusions. The whirlwind path follows whirlwind-insar's soft masking: masked arcs are free to cross during the solve and are blanked afterwards.
